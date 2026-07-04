@@ -1,35 +1,48 @@
-ifeq ($(CONFIG),)
-	CONFIG = release_x64
-endif
+# Convenience wrapper around the CMake build + plotting pipeline.
+#
+#   make               configure+build+run+plot with g++-16 (default)
+#   make PRESET=clang21 ...   use clang++-21 instead
+#   make build         just build
+#   make run           run the benchmark (writes result/<preset>.csv)
+#   make plots         (re)generate PNGs from the CSV
+#   make venv          create the Python venv used for plotting
+#   make clean         remove the current build tree
+#
+# Extra benchmark flags go through ARGS, e.g.:
+#   make run ARGS="--modes=admixture --admix=4,5;9,10 --types=u64,i64"
 
-ifeq ($(VERBOSE),)
-	VERBOSE=1
-endif
+PRESET ?= gcc16
+BUILDDIR := build/$(PRESET)
+CSV := result/$(PRESET).csv
+VENV := .venv
+PY := $(VENV)/bin/python
 
+ARGS ?=
 
-all : bin/itoa_release_x64_gmake
-	cd bin && ./itoa_release_x64_gmake $(ARGS)
-	cd result && make -f makefile
+.PHONY: all build run plots venv configure clean clean-all
 
-bin/itoa_%_gmake : build/gmake/itoa.make
-	cd build/gmake && make -f itoa.make config=$(CONFIG) verbose=$(VERBOSE)
+all: run plots
 
-clean : 
-	rm -rf build/gmake
-	rm -rf build/vs2005
-	rm -rf build/vs2008
-	rm -rf build/vs2010
-	rm -rf intermediate
-	rm -rf src/machine.h
-	rm -rf bin
-	cd result && make -f makefile clean
+configure:
+	cmake --preset $(PRESET)
 
-setup :
-	cd build && ./premake.sh && ./machine.sh
-	
-	
-build/gmake/itoa.make : setup	
-	
-clean_status :
-	@echo "Filesystem status according to GIT"
-	@git clean -dfxn
+build: configure
+	cmake --build $(BUILDDIR) -j
+
+run: build
+	cd $(BUILDDIR) && ./itoa --out=../../$(CSV) $(ARGS)
+
+$(PY):
+	python3 -m venv $(VENV)
+	$(VENV)/bin/pip install -q matplotlib numpy
+
+venv: $(PY)
+
+plots: $(PY)
+	$(PY) plot_results.py $(CSV) --outdir result/plots
+
+clean:
+	rm -rf build/$(PRESET)
+
+clean-all:
+	rm -rf build/gcc16 build/clang21

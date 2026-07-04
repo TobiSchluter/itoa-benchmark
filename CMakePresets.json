@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "gcc16",
+      "displayName": "g++-16 (native)",
+      "binaryDir": "${sourceDir}/build/gcc16",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++-16",
+        "CMAKE_C_COMPILER": "gcc-16",
+        "CMAKE_BUILD_TYPE": "Release",
+        "ITOA_NATIVE": "ON"
+      }
+    },
+    {
+      "name": "clang21",
+      "displayName": "clang++-21 (native)",
+      "binaryDir": "${sourceDir}/build/clang21",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++-21",
+        "CMAKE_C_COMPILER": "clang-21",
+        "CMAKE_BUILD_TYPE": "Release",
+        "ITOA_NATIVE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "gcc16",   "configurePreset": "gcc16" },
+    { "name": "clang21", "configurePreset": "clang21" }
+  ]
+}

@@ -49,4 +49,28 @@ void i64toa_naive(int64_t value, char* buffer) {
     u64toa_naive(u, buffer);
 }
 
-REGISTER_TEST(naive);
+void u128toa_naive(uint128_t value, char* buffer) {
+    char temp[40];      // unsigned 128-bit has at most 39 decimal digits
+    char *p = temp;
+    do {
+        *p++ = char(value % 10) + '0';
+        value /= 10;
+    } while (value > 0);
+
+    do {
+        *buffer++ = *--p;
+    } while (p != temp);
+
+    *buffer = '\0';
+}
+
+void i128toa_naive(int128_t value, char* buffer) {
+    uint128_t u = static_cast<uint128_t>(value);
+    if (value < 0) {
+        *buffer++ = '-';
+        u = ~u + 1;
+    }
+    u128toa_naive(u, buffer);
+}
+
+REGISTER_TEST128(naive);

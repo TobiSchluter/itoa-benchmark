@@ -13,4 +13,10 @@ void u64toa_null(uint64_t, char*) {
 void i64toa_null(int64_t, char*) {
 }
 
-REGISTER_TEST(null);
+void u128toa_null(uint128_t, char*) {
+}
+
+void i128toa_null(int128_t, char*) {
+}
+
+REGISTER_TEST128(null);
