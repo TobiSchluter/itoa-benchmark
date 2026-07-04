@@ -98,7 +98,7 @@ Useful driver options (`itoa --help`):
 --admix=5,6;9,10                digit-length pairs for the admixture sweep
 --admix-step=10                 percentage step of the sweep
 --loguniform=1-10,1-20          length windows
---size=4096 --rounds=6 --passes=1048576
+--size=65536 --rounds=6 --passes=1048576
 --out=results.csv  --no-verify
 ~~~~~~~~
 

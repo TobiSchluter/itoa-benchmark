@@ -234,7 +234,13 @@ struct Config {
     // loguniform windows, empty => full range per type
     std::vector<std::pair<int,int>> logWindows;
 
-    size_t size = 4096;          // dataset size (values)
+    // Dataset size (values). Large on purpose: the branch-sensitive modes
+    // replay a fixed shuffled sequence, and a modern TAGE predictor memorizes
+    // short ones (a single-branch impl like jeaiii shows *zero* admixture hump
+    // at 4096 vs its true ~+160% at 64K+). 64Ki defeats the predictor while
+    // keeping even u128 (1MiB) in L3. Runtime is ~size-independent: passes
+    // auto-scales as passTarget/size, so total conversions stay constant.
+    size_t size = 65536;
     unsigned rounds = 6;         // ABBA rounds
     uint64_t passTarget = 1u << 20;  // ~ calls per single timing
     bool verify = true;
@@ -533,7 +539,7 @@ static void ParseArgs(int argc, char** argv, Config& cfg) {
                    "  --admix=5,6;9,10                (digit-length pairs)\n"
                    "  --admix-step=10                 (%% step for admixture sweep)\n"
                    "  --loguniform=1-10,1-20          (length windows)\n"
-                   "  --size=4096 --rounds=6 --passes=1048576\n"
+                   "  --size=65536 --rounds=6 --passes=1048576\n"
                    "  --out=results.csv  --no-verify\n");
             exit(0);
         }
