@@ -1,76 +1,161 @@
 # itoa Benchmark
 
-Copyright(c) 2014-2016 Milo Yip (miloyip@gmail.com)
+A fork of [Milo Yip's itoa-benchmark](https://github.com/miloyip/itoa-benchmark)
+that was used to develop the **branch-free itoa algorithms** based on the BCD
+(binary-coded decimal) conversion code found in
+[zmij](https://github.com/vitaut/zmij).  On data with numbers of varying magnitude
+these are the fastest codes that I am aware of.
 
-## Introduction
+The new entries appear in the roster four times — the same source
+compiled once per x86-64 microarchitecture level: `zmij_scalar` (SIMD
+disabled), `zmij_sse2`, `zmij_sse41`, and `zmij_avx2`. Notably, even the
+non-SIMD `zmij_scalar` variant is competitive with the fastest branchy
+implementations simply because branches are so expensive: on realistic
+(mixed-length) data, what dominates is not arithmetic but branch
+mispredictions.  The zmij algorithms have no branches and thus no
+mispredictions.
 
-This benchmark evaluates the performance of conversion from integer to ASCII string in decimal. The function prototypes are:
+Besides the new algorithms, this fork adds to the original benchmark:
 
-~~~~~~~~cpp
-void u32toa(uint32_t value, char* buffer);
-void i32toa(int32_t value, char* buffer);
-void u64toa(uint64_t value, char* buffer);
-void i64toa(int64_t value, char* buffer);
-void u128toa(unsigned __int128 value, char* buffer);   // opt-in (fmt/naive)
-void i128toa(__int128 value, char* buffer);            // opt-in (fmt/naive)
-~~~~~~~~
+* **Signed integers** (`i32`/`i64`/`i128`) benchmarked in parallel with the
+  unsigned ones, so the cost of the sign handling is directly comparable.
+* **128-bit integers** (`__int128`), see [below](#128-bit-support).
+* **New benchmark modes** that control the digit-length distribution of the
+  input — the heart of this fork, explained in the following sections.
+* variable data sample length to study the impact of the large branch
+  prediction buffers in CPUs
+* An ABBA/interleaved measurement engine (each implementation is timed over
+  the same dataset in alternating roster order, minimum over rounds) to cancel
+  turbo/thermal drift.
 
-Note that `itoa()` is *not* a standard function in C and C++, but provided by some compilers.
+All plots below were measured on an AMD Zen 5 core (g++-16); the full set,
+including the 64-bit and 128-bit variants of each mode, is in
+[result/plots_zen5](result/plots_zen5).
 
-This fork extends the original benchmark with:
+## The problem: benchmarking with perfect branch prediction
 
-* **128-bit support** (`__int128`). There is no standard formatter for it, so
-  the [{fmt}](https://github.com/fmtlib/fmt) library is used
-  (`fmt::format_to(buf, "{}", value)`). Most implementations do not provide
-  128-bit conversion and are skipped for that width.
-* **{fmt} in the roster**: `fmt::format_int` for 32/64-bit, `fmt::format_to`
-  for 128-bit.
-* **Signed and unsigned in parallel** for every width (`u32/i32`, `u64/i64`,
-  `u128/i128`), so the cost of the sign branch is directly comparable.
-* **Richer digit distributions** beyond a single fixed length (see below).
-* **ABBA / interleaved measurement** to cancel monotonic drift (turbo ramp,
-  thermal): within each round every implementation is timed once over the same
-  dataset and the roster order is reversed every other round, so each function
-  is sampled in both early and late slots; the reported figure is the minimum
-  over rounds.
-* **Plots** generated from the result CSV with matplotlib.
+The original version of this benchmark ran an independent measurement for each
+length: first a pass over nothing but 1-digit values, then a pass over
+2-digit values, and so on. Within each pass every digit-count-related branch
+always goes the same way, so the branch predictor is perfect. That is a fine
+way to study an algorithm's arithmetic, but it does not reflect the
+characteristics of processing realistic data, where the length of the next
+number is not known in advance and length-based branches actually miss.
 
-## Procedure
+This mode is kept as `bylength` — it is the predictable best case, and the
+baseline against which the other modes should be read:
 
-Firstly the program verifies the correctness of implementations against `naive`.
+![bylength, 32-bit](result/plots_zen5/bylength_32.png)
 
-Then the following benchmark modes are carried out (each over a dataset of
-random values with a controlled *digit-length distribution*, converted many
-times with the ABBA/interleaved engine):
+Even in this case the zmij algorithms are fast enough to be competitive, and
+they are the fastest for long digit strings.
 
-1. **bylength** — all values have exactly *D* digits, swept over every *D*.
-   This is the predictable / best case (the predictor learns the constant
-   length). Plotted as ns/op vs digit count.
+## dtolnay's "unpredictable" mode
 
-2. **loguniform** — a shuffled set with an equal number of values in each
-   digit-length bin, over a window of lengths (or all lengths). "Log-uniform"
-   means uniform over the number of digits, i.e. uniform in `log10(value)`.
-   The full-range window is the classic "random" case.
+[dtolnay](https://github.com/dtolnay/itoa-benchmark) created a variation of
+the benchmark in Rust that added an "unpredictable" mode: half of the
+benchmark sample consists of values of varying lengths ("noise"), the other
+half is of the length under test, and the benchmark evaluates the marginal
+cost of the fixed-length half (measure the combined stream, subtract the
+noise-only baseline). This fork implements the same algorithm as the
+`unpredictable` mode.
 
-3. **unpredictable** — a [dtolnay](https://github.com/dtolnay/itoa-benchmark)-style
-   estimator of the marginal cost of a length-*D* value while the branch
-   predictor is thrashed by surrounding random-length noise: measure
-   `noise ++ (values of length D)` and subtract the noise-only baseline. Because
-   half the data is fixed noise and two minima are subtracted, this is a noisy
-   estimator — kept for comparability.
+The name promises more than it delivers, though. Since the fixed-length half
+plus its share of the noise means that over half of the combined stream
+(~55% for 32-bit) has the length under test, any length-based jump will
+actually predict quite well — the predictor simply biases toward the length
+under test. And if an implementation resolves the length through a cascade
+of branches, the later jumps predict even better: if the first branch runs at
+50%, the second runs at 75%, the third at 87.5%, and so on. So while this
+test does reflect some kinds of data, it is not as unpredictable as it may
+seem, and it under-reports the true cost of branching:
 
-4. **admixture** — a shuffled mix of just **two** digit lengths (default 5 and
-   6) at a controlled ratio (0%, 10%, …, 100%). Sweeping the ratio isolates the
-   cost of **branch misprediction** on the digit-count branch: the pure ends
-   predict perfectly, a ~50/50 mix maximises mispredicts and forms a hump. The
-   pair must straddle an implementation's digit-count boundary to expose its
-   branch cost.
+![unpredictable, 32-bit](result/plots_zen5/unpredictable_32.png)
 
-Every mode runs for all requested widths, signed and unsigned.
+In spite of these caveats, zmij carves out a win.
+
+## Admixture: measuring the cost of a mispredicted jump
+
+To demonstrate the effect of branch prediction directly, this fork adds the
+`admixture` mode: the input is a random mix of just two fixed lengths
+(default 5 and 6 digits), and the mixing ratio is swept from 0% to 100%. The
+pure ends predict perfectly; a 50/50 mix maximises mispredictions on any
+branch separating the two lengths:
+
+![admixture 5×6, 32-bit](result/plots_zen5/admixture_32_5x6.png)
+
+Two things stand out:
+
+* The zmij variants are flat, as expected — they have no length branches.
+  But amartin and yy, while branchy, are flat too: unlike the other
+  algorithms they happen to treat 5- and 6-digit numbers in the same
+  branch, so this particular pair never makes them jump. (A pair that
+  straddles one of their branch boundaries would produce the same hump —
+  `--admix` lets you choose the pair.)
+* For the algorithms that *do* branch between 5 and 6 digits the impact is
+  clear: at 50% probability they lose roughly 7 ns per mispredicted jump
+  — the hump adds ~3–3.5 ns per conversion at its peak, where about half the
+  values mispredict.
+
+The branch prediction in CPUs relies on memorizing the jump sequences taken
+by the code.  For too small data sets even these random sets of data are
+perfectly predicted on repetition.  After some experimenting, we chose a
+default benchmark size of 65536 samples, where no predictability effects
+remain but the test data still fits in L3 cache.
+
+## Log-uniform: another random mix
+
+As an alternative to `unpredictable`, the `loguniform` mode benchmarks a
+shuffled set with an equal number of values in each digit-length bin
+(uniform in the number of digits, i.e. uniform in `log10(value)`), over a
+configurable window of lengths. No length dominates, so no length-based
+branch gets to be well-predicted.  Instead of scanning over the number of
+digits this amortizes over the whole range of lengths tested.
+
+![loguniform 1–10 digits, 32-bit](result/plots_zen5/loguniform_32_1_10.png)
+
+This is where the opening claim is visible: every zmij variant — including
+the scalar, non-SIMD one — beats every branchy implementation.  This also
+holds if the distribution is limited to numbers below 10000 which probably
+covers a wide range of applications.
+
+![loguniform 1–4 digits, 32-bit](result/plots_zen5/loguniform_32_1_4.png)
+
+Again, zmij is at the top.  In the case where a 64 bit integer between one
+and four digits is input, `amartin` beats the slower zmij algorithms, but
+the SSE 4.1 version which any current CPU supports still comes out at top.
+
+
+## Byte serialization
+
+Finally, as a fun exercise — but a not-so-rare use case — the `uniform` mode
+benchmarks values equidistributed in a small range, by default 0–255: the
+"printing bytes as decimal" regime (think serializing raw byte arrays or
+writing `PPM` image files). Uniform over *values* rather than lengths, so
+three-digit numbers dominate.  We also added a toy algorithm for this case,
+a specialized converter that takes an integer, and then looks up the string
+corresponding to its lowest 8 bits in a 1024 byte table.  This is likely
+the fastest possible code that actually does this.
+
+![uniform 0–255, 32-bit](result/plots_zen5/uniform_32_0_255.png)
+
+## 128-bit support
+
+The benchmark also covers `unsigned __int128` / `__int128`. There is no
+standard formatter for these, so [{fmt}](https://github.com/fmtlib/fmt)
+(`fmt::format_to`) serves as the reference; most implementations in the
+roster do not provide 128-bit conversion and are skipped for that width:
+
+![bylength, 128-bit](result/plots_zen5/bylength_128.png)
+
+For 128-bit types the admixture mode gains extra sweeps (`straddle64`,
+`straddle1e32`) that mix values just below and just above zmij's internal
+thresholds (2^64 delegation to the 64-bit path, and the 1e32 chunk-count
+boundary), since no digit-count pair reaches those branches.
 
 ## Build and Run
 
-Requirements: CMake ≥ 3.20, a C++17 compiler, and network access on first
+Requirements: CMake ≥ 3.20, a C++14 compiler, and network access on first
 configure (CMake fetches {fmt} via `FetchContent`). Presets are provided for
 `g++-16` (default) and `clang++-21`.
 
@@ -85,124 +170,28 @@ Or drive CMake directly:
 ~~~~~~~~sh
 cmake --preset gcc16
 cmake --build build/gcc16 -j
-./build/gcc16/itoa --out=result/gcc16.csv       # see --help for options
-.venv/bin/python plot_results.py result/gcc16.csv
+./build/gcc16/itoa                              # see --help for options
 ~~~~~~~~
 
 Useful driver options (`itoa --help`):
 
 ~~~~~~~~
---modes=bylength,loguniform,unpredictable,admixture
+--modes=bylength,loguniform,unpredictable,admixture,uniform
 --types=u32,i32,u64,i64,u128,i128
 --filter=sse2,jeaiii,fmt        substring match (comma = OR)
 --admix=5,6;9,10                digit-length pairs for the admixture sweep
 --admix-step=10                 percentage step of the sweep
 --loguniform=1-10,1-20          length windows
+--uniform=0-255                 equidistributed value range
 --size=65536 --rounds=6 --passes=1048576
---out=results.csv  --no-verify
 ~~~~~~~~
 
-Results are written as a CSV (`Type,Function,Mode,Series,X,Time_ns`) and
-`plot_results.py` renders one PNG per (mode, width class) into `result/plots`,
-with signed/unsigned drawn side by side.
+## Credits
 
-### Legacy premake build
-
-The original [premake5](http://industriousone.com/premake/download) build has
-been superseded by CMake (needed to pull in {fmt}); the `build/` premake files
-are kept for reference.
-
-## Results
-
-The following are `sequential` results measured on a PC (Core i7 920 @2.67Ghz), where `u32toa()` is compiled by Visual C++ 2013 and run on Windows 64-bit. The speedup is based on `sprintf()`.
-
-|Function |Time (ns)|Speedup|
-|---------|--------:|------:|
-|sprintf  |  194.225|  1.00x|
-|vc       |   61.522|  3.16x|
-|naive    |   26.743|  7.26x|
-|count    |   20.552|  9.45x|
-|lut      |   17.810| 10.91x|
-|countlut |    9.926| 19.57x|
-|branchlut|    8.430| 23.04x|
-|sse2     |    7.614| 25.51x|
-|null     |    2.230| 87.09x|
-
-![corei7920@2.67_win64_vc2013_u32toa_sequential_time](result/corei7920@2.67_win64_vc2013_u32toa_sequential_time.png)
-
-![corei7920@2.67_win64_vc2013_u32toa_sequential_timedigit](result/corei7920@2.67_win64_vc2013_u32toa_sequential_timedigit.png)
-
-Note that the `null` implementation does nothing. It measures the overheads of looping and function call.
-
-Since the C++ standard library implementations (`ostringstream`, `ostrstream`, `to_string`) are slow, they are turned off by default. User can re-enable them by defining `RUN_CPPITOA` macro.
-
-Some results of various configurations are located at `itoa-benchmark/result`. They can be accessed online, with interactivity provided by [Google Charts](https://developers.google.com/chart/):
-
-* [corei7920@2.67_win32_vc2013](http://rawgit.com/miloyip/itoa-benchmark/master/result/corei7920@2.67_win32_vc2013.html)
-* [corei7920@2.67_win64_vc2013](http://rawgit.com/miloyip/itoa-benchmark/master/result/corei7920@2.67_win64_vc2013.html)
-* [corei7920@2.67_cygwin32_gcc4.8](http://rawgit.com/miloyip/itoa-benchmark/master/result/corei7920@2.67_cygwin32_gcc4.8.html)
-* [corei7920@2.67_cygwin64_gcc4.8](http://rawgit.com/miloyip/itoa-benchmark/master/result/corei7920@2.67_cygwin64_gcc4.8.html)
-
-## Implementations
-
-Function      | Description
---------------|-----------
-ostringstream | `std::ostringstream` in C++ standard library.
-ostrstream    | `std::ostrstream` in C++ standard library.
-to_string     | `std::to_string()` in C++11 standard library.
-sprintf       | `sprintf()` in C standard library
-vc            | Visual C++'s `_itoa()`, `_i64toa()`, `_ui64toa()`
-naive         | Compute division/modulo of 10 for each digit, store digits in temp array and copy to buffer in reverse order.
-unnamed       | Compute division/modulo of 10 for each digit, store directly in buffer
-count         | Count number of decimal digits first, using technique from [1].
-lut           | Uses lookup table (LUT) of digit pairs for division/modulo of 100. Mentioned in [2]
-countlut      | Combines count and lut.
-branchlut     | Use branching to divide-and-conquer the range of value, make computation more parallel.
-sse2          | Based on branchlut scheme, use SSE2 SIMD instructions to convert 8 digits in parallel. The algorithm is designed by Wojciech Muła [3]. (Experiment shows it is useful for values equal to or more than 9 digits)
-fmt           | [{fmt}](https://github.com/fmtlib/fmt): `fmt::format_int` for 32/64-bit and `fmt::format_to(buf, "{}", value)` for 128-bit.
-null          | Do nothing.
-
-## Warm-up and the AVX↔SSE transition penalty
-
-Two guards against measurement distortion:
-
-* **Warm-up.** Before the timed rounds, every implementation is run once over
-  the dataset untimed (primes I/D caches and the branch predictor, lets the core
-  ramp to its turbo frequency). The ABBA min-over-rounds then discards any
-  remaining cold sample.
-* **`vzeroupper` between timed blocks.** An AVX routine that leaves the upper
-  128 bits of the YMM registers "dirty" makes subsequent *legacy*-SSE code pay a
-  per-instruction transition penalty until the state is cleared. Since the engine
-  times different implementations back to back (an AVX one right before a
-  legacy-SSE one), the driver issues `_mm256_zeroupper()` before each timed block
-  so that penalty is not misattributed to the following implementation.
-
-## FAQ
-
-1. How to add an implementation?
-   
-   You may clone an existing implementation file (e.g. `naive.cpp`). And then modify it. Re-run `premake` to add it to project or makefile. Note that it will automatically register to the benchmark by macro `REGISTER_TEST(name)`.
-
-   Making pull request of new implementations is welcome.
-
-2. Why not converting integers to `std::string`?
-
-   It may introduce heap allocation, which is a big overhead. User can easily wrap these low-level functions to return `std::string`, if needed.
-
-3. Why fast `itoa()` functions is needed?
-
-   They are a very common operations in writing data in text format. The standard way of `sprintf()`, `std::stringstream`, `std::to_string(int)` (C++11) often provides poor performance. The author of this benchmark would optimize the "naive" implementation in [RapidJSON](https://github.com/miloyip/rapidjson/issues/31), thus he creates this project.
-
-## References
-
-[1] Anderson, [Bit Twiddling Hacks](https://graphics.stanford.edu/~seander/bithacks.html#IntegerLog10), 1997.
-
-[2] Alexandrescu, [Three Optimization Tips for C++](http://www.slideshare.net/andreialexandrescu1/three-optimization-tips-for-c-15708507), 2012.
-
-[3] Muła, [SSE: conversion integers to decimal representation](http://wm.ite.pl/articles/sse-itoa.html), 2011.
-
-## Related Benchmarks and Discussions
-
-* [The String Formatters of Manor Farm] (http://www.gotw.ca/publications/mill19.htm) by Herb Sutter, 2001.
-* [C++ itoa benchmark](https://github.com/localvoid/cxx-benchmark-itoa) by [localvoid](https://github.com/localvoid)
-* [Stackoverflow: C++ performance challenge: integer to std::string conversion](http://stackoverflow.com/questions/4351371/c-performance-challenge-integer-to-stdstring-conversion)
+* [Milo Yip's original itoa-benchmark](https://github.com/miloyip/itoa-benchmark)
+  — benchmark framework and most of the implementations in the roster (see
+  the original readme for descriptions of the individual algorithms).
+* [dtolnay's Rust variation](https://github.com/dtolnay/itoa-benchmark) — the
+  unpredictable-mode algorithm.
+* [zmij](https://github.com/vitaut/zmij) — the BCD conversion codes that were
+  reused in the `zmij-*` algorithms in this benchmark.
