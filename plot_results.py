@@ -33,6 +33,7 @@ MODE_TITLES = {
     "loguniform":    "Log-uniform mix (equal count per digit length)",
     "unpredictable": "Marginal cost under unpredictable-length noise",
     "admixture":     "Two-length admixture (branch-misprediction sweep)",
+    "uniform":       "Equidistributed values (byte-printing regime)",
 }
 
 
@@ -52,6 +53,16 @@ def color_map(functions):
     base = (matplotlib.colormaps["tab20"].colors
             + matplotlib.colormaps["tab20b"].colors)
     return {fn: base[i % len(base)] for i, fn in enumerate(funcs)}
+
+
+# Distinct filled marker shapes, cycled per function on top of colour so lines
+# stay tellable apart in dense plots (and in print / greyscale).
+_MARKERS = ["o", "s", "^", "v", "D", "P", "X", "*", "<", ">", "p", "h", "H", "d", "8"]
+
+
+def marker_map(functions):
+    funcs = sorted(functions)
+    return {fn: _MARKERS[i % len(_MARKERS)] for i, fn in enumerate(funcs)}
 
 
 def clean_style():
@@ -89,7 +100,7 @@ def subset(rows, mode, typ, series):
     return out
 
 
-def plot_line(rows, mode, wc_name, types, series, colors, outdir, logy):
+def plot_line(rows, mode, wc_name, types, series, colors, markers, outdir, logy):
     present = [t for t in types if any(
         r["Type"] == t and r["Mode"] == mode and r["Series"] == series for r in rows)]
     if not present:
@@ -97,17 +108,34 @@ def plot_line(rows, mode, wc_name, types, series, colors, outdir, logy):
     fig, axes = plt.subplots(1, len(present), figsize=(6.2 * len(present), 4.4),
                              squeeze=False, sharey=True)
     axes = axes[0]
+    # For admixture, plot magnitude increasing left->right: x = % of the LARGER
+    # value, so the left edge is all-smaller and the right edge all-larger.
+    # Stored X is % of the smaller value, so plot 100 - X.
     xlabel = "decimal digits"
+    flip = mode == "admixture"
     if mode == "admixture":
-        a = series.split("x")[0]
-        xlabel = f"% of {a}-digit values (rest = {series.split('x')[1]}-digit)"
+        if "x" in series:
+            a, b = series.split("x")
+            xlabel = f"% of {b}-digit values (rest = {a}-digit)"
+        elif series == "straddle64":
+            xlabel = "% of values above 2^64 (rest below; u64↔u128 branch)"
+        elif series == "straddle1e32":
+            xlabel = "% of values above 1e32 (rest below; 1-peel↔2-peel branch)"
 
+    # The straddle sweeps exist to expose zmij's u128 branch bumps; the fmt/naive
+    # baselines (~250ns) would dwarf them, so drop them and let the axis zoom to
+    # the zmij range.
+    drop = {"fmt", "naive"} if series.startswith("straddle") else set()
     used = set()
     for ax, typ in zip(axes, present):
         data = subset(rows, mode, typ, series)
         for fn in sorted(data):
+            if fn in drop:
+                continue
             xs, ys = data[fn]
-            ax.plot(xs, ys, marker="o", color=colors[fn], label=fn)
+            if flip:
+                xs = [100 - x for x in xs]
+            ax.plot(xs, ys, marker=markers[fn], color=colors[fn], label=fn)
             used.add(fn)
         ax.set_title(typ)
         ax.set_xlabel(xlabel)
@@ -115,7 +143,7 @@ def plot_line(rows, mode, wc_name, types, series, colors, outdir, logy):
             ax.set_yscale("log")
     axes[0].set_ylabel("ns / conversion")
 
-    handles = [plt.Line2D([], [], color=colors[fn], marker="o", label=fn)
+    handles = [plt.Line2D([], [], color=colors[fn], marker=markers[fn], label=fn)
                for fn in sorted(used)]
     fig.legend(handles=handles, loc="center left", bbox_to_anchor=(1.0, 0.5),
                fontsize=8, ncol=1)
@@ -190,6 +218,7 @@ def main():
 
     clean_style()
     colors = color_map({r["Function"] for r in rows})
+    markers = marker_map({r["Function"] for r in rows})
     modes = sorted({r["Mode"] for r in rows})
 
     for mode in modes:
@@ -200,11 +229,17 @@ def main():
             if excl_small and not wc_name.startswith("128"):
                 wc_rows = [r for r in rows if r["Function"] not in excl_small]
             for series in series_for(wc_rows, mode, types):
-                if mode == "loguniform":
+                if mode in ("loguniform", "uniform"):
                     plot_bars(wc_rows, mode, wc_name, types, series, colors, outdir)
                 else:
-                    logy = mode in ("bylength", "unpredictable")
-                    plot_line(wc_rows, mode, wc_name, types, series, colors, outdir, logy)
+                    # bylength/unpredictable are linear at 32/64-bit; 128-bit
+                    # keeps log, where the naive baseline dominates the range.
+                    # The straddle sweeps drop fmt/naive (see plot_line), so their
+                    # zmij-only range is tight -- linear shows the additive branch
+                    # bump far better than log.
+                    is_128 = wc_name.startswith("128")
+                    logy = mode in ("bylength", "unpredictable") and is_128
+                    plot_line(wc_rows, mode, wc_name, types, series, colors, markers, outdir, logy)
 
     print("\nDone. PNGs in", outdir)
 

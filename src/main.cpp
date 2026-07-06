@@ -196,6 +196,20 @@ static std::vector<T> GenLogUniform(std::mt19937_64& rng, int loD, int hiD, size
     return v;
 }
 
+// Equidistributed values in [lo, hi] (default bytes, 0..255): uniform over
+// VALUES, not digit lengths, so short lengths dominate. No sign flip -- this
+// models byte-like data. Already i.i.d., no shuffle needed.
+template <typename T>
+static std::vector<T> GenUniform(std::mt19937_64& rng, uint64_t lo, uint64_t hi, size_t n) {
+    uint128_t hiC = hi;
+    if (hiC > Traits<T>::MaxMagnitude())
+        hiC = Traits<T>::MaxMagnitude();
+    std::vector<T> v(n);
+    for (size_t i = 0; i < n; i++)
+        v[i] = (T)RandRange(rng, lo, hiC);
+    return v;
+}
+
 // A "mixed" set of n values cycling through every digit length 1..kMaxDigit,
 // then shuffled. This is the predictor-thrashing noise used by the
 // unpredictable mode (mirrors dtolnay's itoa-benchmark).
@@ -220,19 +234,49 @@ static std::vector<T> GenAdmixture(std::mt19937_64& rng, int dA, int dB, int per
     return v;
 }
 
+// Admixture straddling a threshold (only meaningful for 128-bit T). zmij's
+// 128-bit path has two internal branches, both of which cost a mispredict on a
+// mixed stream but neither of which a digit-count admixture (5,6...) reaches:
+//   * value <= UINT64_MAX (2^64): delegate to the u64 path vs the chunked u128
+//     path -- a boundary in *bits*, mid-way through the 20-digit range.
+//   * value < 1e32: one 16-digit peel (20-32 digits) vs two peels (33-39) --
+//     the interior-chunk count branch.
+// This mixes values ~2 decimal orders below the threshold with ~2 orders above,
+// so sweeping the ratio exposes the chosen branch regardless of digit counting.
+template <typename T>
+static std::vector<T> GenStraddle(std::mt19937_64& rng, uint128_t threshold,
+                                  int percentBelow, size_t n) {
+    const uint128_t loBelow = threshold / 100, hiBelow = threshold - 1;      // below
+    const uint128_t loAbove = threshold,       hiAbove = threshold * 100 - 1;  // above
+    const size_t countBelow = (size_t)((n * (uint64_t)percentBelow) / 100);
+    std::vector<T> v;
+    v.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+        bool below = i < countBelow;
+        uint128_t mag = below ? RandRange(rng, loBelow, hiBelow)
+                              : RandRange(rng, loAbove, hiAbove);
+        bool neg = Traits<T>::kSigned && (rng() & 1);
+        v.push_back(MakeValue<T>(mag, neg));
+    }
+    std::shuffle(v.begin(), v.end(), rng);
+    return v;
+}
+
 // ---------------------------------------------------------------------------
 // Configuration (populated from argv)
 // ---------------------------------------------------------------------------
 struct AdmixPair { int a, b; };
 
 struct Config {
-    std::set<std::string> modes { "bylength", "loguniform", "unpredictable", "admixture" };
+    std::set<std::string> modes { "bylength", "loguniform", "unpredictable", "admixture", "uniform" };
     std::set<std::string> types { "u32", "i32", "u64", "i64", "u128", "i128" };
     std::vector<std::string> filters;                  // empty => all
     std::vector<AdmixPair> admixPairs { { 5, 6 } };
     int admixStep = 10;
     // loguniform windows, empty => full range per type
     std::vector<std::pair<int,int>> logWindows;
+    // uniform-mode value range (equidistributed values, byte-like data)
+    uint64_t uniformLo = 0, uniformHi = 255;
 
     // Dataset size (values). Large on purpose: the branch-sensitive modes
     // replay a fixed shuffled sequence, and a modern TAGE predictor memorizes
@@ -285,17 +329,20 @@ static void Verify(void(*f)(T, char*), void(*g)(T, char*),
     VerifyValue<T>(Traits<T>::Max(), f, g, fname, gname);
 
     for (uint32_t power = 2; power <= 10; power += 8) {
-        T i = 1, last;
-        do {
+        T i = 1;
+        for (;;) {
             VerifyValue<T>(i - 1, f, g, fname, gname);
             VerifyValue<T>(i, f, g, fname, gname);
             if (Traits<T>::kSigned) {
                 VerifyValue<T>((T)-i, f, g, fname, gname);
                 VerifyValue<T>((T)-(i + 1), f, g, fname, gname);
             }
-            last = i;
+            // Overflow-proof advance: signed i *= power past max is UB, which
+            // clang -O3 turns into an infinite loop (gcc happens to wrap).
+            if (i > Traits<T>::Max() / (T)power)
+                break;
             i *= power;
-        } while (last < i);
+        }
     }
     printf("OK\n");
 }
@@ -317,6 +364,9 @@ static void VerifyAll(const Config& cfg) {
 
     for (const Test* t : tests) {
         if (strcmp(t->fname, "null") == 0) continue;
+        // toy256 is by design only correct on [0, 255] (it truncates), so it
+        // cannot pass the general verification.
+        if (strcmp(t->fname, "toy256") == 0) continue;
         if (!cfg.MatchFilter(t->fname)) continue;
         try {
             if (cfg.WantType("u32"))  VerifyWidth<uint32_t>(naive, t);
@@ -407,6 +457,12 @@ static void RunType(const Config& cfg, FILE* fp) {
     }
     if (fns.empty()) return;
 
+    // toy256 truncates to [0, 255], so it is only meaningful in the byte-range
+    // 'uniform' regime; every other mode uses the list without it.
+    std::vector<FuncEntry<T>> fnsNoToy;
+    for (const auto& e : fns)
+        if (strcmp(e.name, "toy256") != 0) fnsNoToy.push_back(e);
+
     std::mt19937_64 rng(gSeed);
     const char* tn = Traits<T>::Name();
     printf("\n==== %-4s  (%zu impls) ====\n", tn, fns.size());
@@ -416,8 +472,8 @@ static void RunType(const Config& cfg, FILE* fp) {
         printf("  bylength (ns/op by digit count):\n");
         for (int d = 1; d <= Traits<T>::kMaxDigit; d++) {
             auto data = GenByLength<T>(rng, d, cfg.size);
-            auto res = InterleavedMeasure<T>(fns, data, cfg);
-            Report<T>(fp, fns, res, "bylength", "", d);
+            auto res = InterleavedMeasure<T>(fnsNoToy, data, cfg);
+            Report<T>(fp, fnsNoToy, res, "bylength", "", d);
             double lo = *std::min_element(res.begin(), res.end());
             printf("    d=%2d  best=%7.3f ns\n", d, lo);
         }
@@ -426,44 +482,67 @@ static void RunType(const Config& cfg, FILE* fp) {
     // ---- loguniform -----------------------------------------------------
     if (cfg.modes.count("loguniform")) {
         std::vector<std::pair<int,int>> windows = cfg.logWindows;
-        if (windows.empty())
+        if (windows.empty()) {
             windows.push_back({ 1, Traits<T>::kMaxDigit });   // all lengths
+            windows.push_back({ 1, 4 });                      // "realistic": small values
+        }
         for (auto& w : windows) {
             int loD = std::max(1, w.first);
             int hiD = std::min((int)Traits<T>::kMaxDigit, w.second);
             if (loD > hiD) continue;
             auto data = GenLogUniform<T>(rng, loD, hiD, cfg.size);
-            auto res = InterleavedMeasure<T>(fns, data, cfg);
+            auto res = InterleavedMeasure<T>(fnsNoToy, data, cfg);
             char series[32];
             snprintf(series, sizeof series, "%d-%d", loD, hiD);
-            Report<T>(fp, fns, res, "loguniform", series, hiD - loD + 1);
+            Report<T>(fp, fnsNoToy, res, "loguniform", series, hiD - loD + 1);
             double lo = *std::min_element(res.begin(), res.end());
             printf("  loguniform[%s] (%d lengths): best=%7.3f ns\n",
                    series, hiD - loD + 1, lo);
         }
     }
 
+    // ---- uniform ---------------------------------------------------------
+    // Equidistributed values in a small range (default 0..255): the byte-
+    // printing regime, where a full string-lookup table (toy256) is possible.
+    if (cfg.modes.count("uniform")) {
+        auto data = GenUniform<T>(rng, cfg.uniformLo, cfg.uniformHi, cfg.size);
+        auto res = InterleavedMeasure<T>(fns, data, cfg);
+        char series[48];
+        snprintf(series, sizeof series, "%llu-%llu",
+                 (unsigned long long)cfg.uniformLo,
+                 (unsigned long long)cfg.uniformHi);
+        Report<T>(fp, fns, res, "uniform", series, 0);
+        double lo = *std::min_element(res.begin(), res.end());
+        printf("  uniform[%s]: best=%7.3f ns\n", series, lo);
+    }
+
     // ---- unpredictable (dtolnay-style) ----------------------------------
-    // Marginal cost of a length-d value when the branch predictor is thrashed
-    // by surrounding random-length "noise": measure (noise ++ length-d) and
-    // subtract the noise-only baseline. Because half the data is fixed noise
-    // and two minima are subtracted, this is a noisy estimator -- kept for
-    // comparability with dtolnay's benchmark.
+    // Marginal cost of a length-d value amid random-length "noise": measure
+    // (noise ++ length-d) and subtract the noise-only baseline.
+    //
+    // This matches dtolnay's algorithm exactly, but note the name is a
+    // misnomer: the combined set is HALF one constant length (the size copies
+    // of length-d appended to size noise values), so >50% of the stream is
+    // predictable and the predictor biases toward length-d and predicts those
+    // values correctly. It therefore UNDER-reports branch-misprediction cost --
+    // e.g. jeaiii reads near its predicted-compute floor here while the
+    // admixture sweep shows its true ~+6ns hump. Use admixture for branch cost;
+    // this mode is kept only for comparability with dtolnay's benchmark.
     if (cfg.modes.count("unpredictable")) {
         auto mixed = GenMixedAllLengths<T>(rng, cfg.size);
-        auto baseline = InterleavedMeasure<T>(fns, mixed, cfg);   // ns/op over noise
+        auto baseline = InterleavedMeasure<T>(fnsNoToy, mixed, cfg);   // ns/op over noise
         printf("  unpredictable (marginal ns/op by digit count, noise-subtracted):\n");
         for (int d = 1; d <= Traits<T>::kMaxDigit; d++) {
             std::vector<T> data = mixed;
             for (size_t i = 0; i < cfg.size; i++)
                 data.push_back(RandomValueOfLength<T>(rng, d));
             std::shuffle(data.begin(), data.end(), rng);
-            auto comb = InterleavedMeasure<T>(fns, data, cfg);    // ns/op over 2*size
+            auto comb = InterleavedMeasure<T>(fnsNoToy, data, cfg);    // ns/op over 2*size
             // marginal per length-d op = 2*comb - baseline (see note in header)
-            std::vector<double> marg(fns.size());
-            for (size_t i = 0; i < fns.size(); i++)
+            std::vector<double> marg(fnsNoToy.size());
+            for (size_t i = 0; i < fnsNoToy.size(); i++)
                 marg[i] = 2.0 * comb[i] - baseline[i];
-            Report<T>(fp, fns, marg, "unpredictable", "", d);
+            Report<T>(fp, fnsNoToy, marg, "unpredictable", "", d);
             double lo = *std::min_element(marg.begin(), marg.end());
             printf("    d=%2d  best=%7.3f ns\n", d, lo);
         }
@@ -478,10 +557,33 @@ static void RunType(const Config& cfg, FILE* fp) {
             printf("  admixture %s (ns/op vs %% of %d-digit):\n", series, pr.a);
             for (int p = 0; p <= 100; p += cfg.admixStep) {
                 auto data = GenAdmixture<T>(rng, pr.a, pr.b, p, cfg.size);
-                auto res = InterleavedMeasure<T>(fns, data, cfg);
-                Report<T>(fp, fns, res, "admixture", series, p);
+                auto res = InterleavedMeasure<T>(fnsNoToy, data, cfg);
+                Report<T>(fp, fnsNoToy, res, "admixture", series, p);
                 double lo = *std::min_element(res.begin(), res.end());
                 printf("    %3d%%  best=%7.3f ns\n", p, lo);
+            }
+        }
+
+        // 128-bit only: sweep the mix straddling each of zmij's two u128
+        // branch thresholds. straddle64 (2^64) exposes the u64<->u128 delegation
+        // branch (a boundary in bits); straddle1e32 (1e32) exposes the one-peel
+        // (20-32 digits) vs two-peel (33-39) interior-chunk branch. A digit-pair
+        // admixture reaches neither.
+        if (sizeof(T) > 8) {
+            const uint128_t e16 = 10'000'000'000'000'000ull;  // 1e16
+            struct { const char* series; uint128_t threshold; } straddles[] = {
+                {"straddle64", (uint128_t)1 << 64},
+                {"straddle1e32", e16 * e16},  // 1e32
+            };
+            for (auto& st : straddles) {
+                printf("  admixture %s (ns/op vs %% below threshold):\n", st.series);
+                for (int p = 0; p <= 100; p += cfg.admixStep) {
+                    auto data = GenStraddle<T>(rng, st.threshold, p, cfg.size);
+                    auto res = InterleavedMeasure<T>(fnsNoToy, data, cfg);
+                    Report<T>(fp, fnsNoToy, res, "admixture", st.series, p);
+                    double lo = *std::min_element(res.begin(), res.end());
+                    printf("    %3d%% below  best=%7.3f ns\n", p, lo);
+                }
             }
         }
     }
@@ -525,6 +627,13 @@ static void ParseArgs(int argc, char** argv, Config& cfg) {
                 if (ab.size() == 2) cfg.admixPairs.push_back({ atoi(ab[0].c_str()), atoi(ab[1].c_str()) });
             }
         }
+        else if (key == "--uniform") {
+            auto lh = Split(val, '-');
+            if (lh.size() == 2) {
+                cfg.uniformLo = strtoull(lh[0].c_str(), nullptr, 10);
+                cfg.uniformHi = strtoull(lh[1].c_str(), nullptr, 10);
+            }
+        }
         else if (key == "--loguniform") {
             for (auto& w : Split(val, ',')) {
                 auto lh = Split(w, '-');
@@ -533,12 +642,13 @@ static void ParseArgs(int argc, char** argv, Config& cfg) {
         }
         else if (key == "--help" || key == "-h") {
             printf("Usage: itoa [options]\n"
-                   "  --modes=bylength,loguniform,unpredictable,admixture\n"
+                   "  --modes=bylength,loguniform,unpredictable,admixture,uniform\n"
                    "  --types=u32,i32,u64,i64,u128,i128\n"
                    "  --filter=sse2,jeaiii,fmt        (substring, comma = OR)\n"
                    "  --admix=5,6;9,10                (digit-length pairs)\n"
                    "  --admix-step=10                 (%% step for admixture sweep)\n"
                    "  --loguniform=1-10,1-20          (length windows)\n"
+                   "  --uniform=0-255                 (equidistributed value range)\n"
                    "  --size=65536 --rounds=6 --passes=1048576\n"
                    "  --out=results.csv  --no-verify\n");
             exit(0);
