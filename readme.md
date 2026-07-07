@@ -6,9 +6,9 @@ that was used to develop the **branch-free itoa algorithms** based on the BCD
 [zmij](https://github.com/vitaut/zmij).  On data with numbers of varying magnitude
 these are the fastest codes that I am aware of.
 
-The new entries appear in the roster four times — the same source
-compiled once per x86-64 microarchitecture level: `zmij_scalar` (SIMD
-disabled), `zmij_sse2`, `zmij_sse41`, and `zmij_avx2`. Notably, even the
+The new entries appear in the roster four times, a scalar fallback `zmij_scalar` and
+SIMD variants optimized for the various x64 microarchitecture levels: `zmij_sse2` (v1),
+`zmij_sse41` (v2), and `zmij_avx2` (v3).  Notably, even the
 non-SIMD `zmij_scalar` variant is competitive with the fastest branchy
 implementations simply because branches are so expensive: on realistic
 (mixed-length) data, what dominates is not arithmetic but branch
@@ -23,7 +23,7 @@ Besides the new algorithms, this fork adds to the original benchmark:
 * **New benchmark modes** that control the digit-length distribution of the
   input — the heart of this fork, explained in the following sections.
 * variable data sample length to study the impact of the large branch
-  prediction buffers in CPUs
+  prediction buffers in CPUs.
 * An ABBA/interleaved measurement engine (each implementation is timed over
   the same dataset in alternating roster order, minimum over rounds) to cancel
   turbo/thermal drift.
@@ -37,13 +37,14 @@ including the 64-bit and 128-bit variants of each mode, is in
 The original version of this benchmark ran an independent measurement for each
 length: first a pass over nothing but 1-digit values, then a pass over
 2-digit values, and so on. Within each pass every digit-count-related branch
-always goes the same way, so the branch predictor is perfect. That is a fine
+always goes the same way, so the branch prediction is perfect. That is a fine
 way to study an algorithm's arithmetic, but it does not reflect the
 characteristics of processing realistic data, where the length of the next
 number is not known in advance and length-based branches actually miss.
 
-This mode is kept as `bylength` — it is the predictable best case, and the
-baseline against which the other modes should be read:
+This mode is kept as `bylength`.  It is the predictable best case, and it can
+give a lower bound of evaluation time, but no estimate for the performance
+under non-pathological realistic workloads.
 
 ![bylength, 32-bit](result/plots_zen5/bylength_32.png)
 
@@ -52,23 +53,22 @@ they are the fastest for long digit strings.
 
 ## dtolnay's "unpredictable" mode
 
-[dtolnay](https://github.com/dtolnay/itoa-benchmark) created a variation of
-the benchmark in Rust that added an "unpredictable" mode: half of the
-benchmark sample consists of values of varying lengths ("noise"), the other
-half is of the length under test, and the benchmark evaluates the marginal
-cost of the fixed-length half (measure the combined stream, subtract the
-noise-only baseline). This fork implements the same algorithm as the
-`unpredictable` mode.
+Dave Tolnay created [a variation of the benchmark](https://github.com/dtolnay/itoa-benchmark)
+that added an "unpredictable" mode: half of the benchmark sample consists
+of values of varying lengths ("noise"), the other half is of the length
+under test, and the benchmark evaluates the marginal cost of the fixed-length
+half (measure the combined stream, subtract the noise-only baseline). This
+fork implements the same algorithm as the `unpredictable` mode.
 
 The name promises more than it delivers, though. Since the fixed-length half
 plus its share of the noise means that over half of the combined stream
 (~55% for 32-bit) has the length under test, any length-based jump will
 actually predict quite well — the predictor simply biases toward the length
-under test. And if an implementation resolves the length through a cascade
-of branches, the later jumps predict even better: if the first branch runs at
-50%, the second runs at 75%, the third at 87.5%, and so on. So while this
-test does reflect some kinds of data, it is not as unpredictable as it may
-seem, and it under-reports the true cost of branching:
+under test.  And if an implementation resolves the length through a cascade
+of branches, the later jumps predict even better: if each branch divides the
+remaining data set in half based on length then the first branch will be 55%
+predictable, the second branch 83%, and so on.[^1]  So while this test does
+reflect some kinds of data, it is not as unpredictable as it may seem.
 
 ![unpredictable, 32-bit](result/plots_zen5/unpredictable_32.png)
 
@@ -79,7 +79,7 @@ In spite of these caveats, zmij carves out a win.
 To demonstrate the effect of branch prediction directly, this fork adds the
 `admixture` mode: the input is a random mix of just two fixed lengths
 (default 5 and 6 digits), and the mixing ratio is swept from 0% to 100%. The
-pure ends predict perfectly; a 50/50 mix maximises mispredictions on any
+pure ends predict perfectly; a 50/50 mix maximizes mispredictions on any
 branch separating the two lengths:
 
 ![admixture 5×6, 32-bit](result/plots_zen5/admixture_32_5x6.png)
@@ -92,38 +92,36 @@ Two things stand out:
   branch, so this particular pair never makes them jump. (A pair that
   straddles one of their branch boundaries would produce the same hump —
   `--admix` lets you choose the pair.)
-* For the algorithms that *do* branch between 5 and 6 digits the impact is
-  clear: at 50% probability they lose roughly 7 ns per mispredicted jump
-  — the hump adds ~3–3.5 ns per conversion at its peak, where about half the
-  values mispredict.
+* For the algorithms that do branch between 5 and 6 digits the impact is
+  clear: at 50% probability they lose roughly 3.5 ns per mispredicted jump.
 
 The branch prediction in CPUs relies on memorizing the jump sequences taken
 by the code.  For too small data sets even these random sets of data are
 perfectly predicted on repetition.  After some experimenting, we chose a
-default benchmark size of 65536 samples, where no predictability effects
+default benchmark size of 65536 samples, where little predictability effects
 remain but the test data still fits in L3 cache.
 
 ## Log-uniform: another random mix
 
 As an alternative to `unpredictable`, the `loguniform` mode benchmarks a
 shuffled set with an equal number of values in each digit-length bin
-(uniform in the number of digits, i.e. uniform in `log10(value)`), over a
-configurable window of lengths. No length dominates, so no length-based
+(uniform in the number of digits, i.e. uniform in `floor(log10(value))`),
+over a configurable window of lengths. No length dominates, so no length-based
 branch gets to be well-predicted.  Instead of scanning over the number of
 digits this amortizes over the whole range of lengths tested.
 
 ![loguniform 1–10 digits, 32-bit](result/plots_zen5/loguniform_32_1_10.png)
 
-This is where the opening claim is visible: every zmij variant — including
-the scalar, non-SIMD one — beats every branchy implementation.  This also
-holds if the distribution is limited to numbers below 10000 which probably
-covers a wide range of applications.
+Every zmij variant — including the scalar, non-SIMD one — beats every branchy
+implementation, and it does so by a distance.  Numbers that span the
+whole range are probably seldom enough to dimiss this as artificial, so we
+also show the restriction to numbers with one to four digits.
 
 ![loguniform 1–4 digits, 32-bit](result/plots_zen5/loguniform_32_1_4.png)
 
 Again, zmij is at the top.  In the case where a 64 bit integer between one
-and four digits is input, `amartin` beats the slower zmij algorithms, but
-the SSE 4.1 version which any current CPU supports still comes out at top.
+and four digits is input (not shown), `amartin` and `yy` beat the zmij's
+`scalar` fallback algorithms, but the SIMD variants come out at top.
 
 
 ## Byte serialization
@@ -131,13 +129,18 @@ the SSE 4.1 version which any current CPU supports still comes out at top.
 Finally, as a fun exercise — but a not-so-rare use case — the `uniform` mode
 benchmarks values equidistributed in a small range, by default 0–255: the
 "printing bytes as decimal" regime (think serializing raw byte arrays or
-writing `PPM` image files). Uniform over *values* rather than lengths, so
-three-digit numbers dominate.  We also added a toy algorithm for this case,
-a specialized converter that takes an integer, and then looks up the string
-corresponding to its lowest 8 bits in a 1024 byte table.  This is likely
-the fastest possible code that actually does this.
+writing `PPM` image files).  The distribution is uniform over values rather
+than lengths, so three-digit numbers dominate.  We also added the `toy256`
+algorithm for this case, a specialized converter that takes an integer,
+and then looks up the string corresponding to its lowest eight bits in a 256
+entry table.  This algorithm is so fast that in the benchmark run used to
+create the plots it actually beat the do-nothing (`null`) version.
 
 ![uniform 0–255, 32-bit](result/plots_zen5/uniform_32_0_255.png)
+
+Of the general algorithms again zmij comes out at top.  The `tmueller`
+algorithm is almost as fast, but even the fallback `zmij_scalar` beats
+eveything else.
 
 ## 128-bit support
 
@@ -150,8 +153,8 @@ roster do not provide 128-bit conversion and are skipped for that width:
 
 For 128-bit types the admixture mode gains extra sweeps (`straddle64`,
 `straddle1e32`) that mix values just below and just above zmij's internal
-thresholds (2^64 delegation to the 64-bit path, and the 1e32 chunk-count
-boundary), since no digit-count pair reaches those branches.
+thresholds (2^64 delegation to the 64-bit path, and the 10^32 chunk-count
+boundary).
 
 ## Build and Run
 
@@ -195,3 +198,18 @@ Useful driver options (`itoa --help`):
   unpredictable-mode algorithm.
 * [zmij](https://github.com/vitaut/zmij) — the BCD conversion codes that were
   reused in the `zmij-*` algorithms in this benchmark.
+
+[^1]: If we are using ten bins of data, then the `unpredictable`
+benchmark will distribute the data such that the bin under test contains
+55% of the data and the other bins 5% each.  If we assume for simplicity
+a jump cascade that excludes half the range at each step, then in the first
+step, 75% of the data will lie on the side where the test data is found, and
+25% will lie on the other side.  So this jump will be predicted correctly
+75% of the time.  The 25% on the other side remain equidistributed and
+unpredictable, but on the side where we are testing, we have five bins.
+Four contain 5% of the data, and one that contains 55%.  In the next step
+we again divide into two equal groups (which is not possible based on digit
+counts, but we ignore that for the sake of argument).  On the one side of
+the dividing line we have 5×5% / 2 = 12.5% of the data, on the other side
+50% + 5×5% / 2 = 62.5%.  This branch will be predicted correctly 62.5% / 75%
+= 83% of the time.  And so on.
