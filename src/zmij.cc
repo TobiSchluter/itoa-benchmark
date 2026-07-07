@@ -143,6 +143,14 @@ static_assert(!ZMIJ_USE_SSE4_1 || ZMIJ_USE_SSE);
 #  define ZMIJ_INLINE inline
 #endif
 
+#if ZMIJ_HAS_ATTRIBUTE(noinline)
+#  define ZMIJ_NOINLINE __attribute__((noinline))
+#elif ZMIJ_MSC_VER
+#  define ZMIJ_NOINLINE __declspec(noinline)
+#else
+#  define ZMIJ_NOINLINE
+#endif
+
 #if defined(__GNUC__) && !ZMIJ_NEON2SSE_SHIM
 #  define ZMIJ_ASM(x) asm x
 #else
@@ -1492,7 +1500,7 @@ ZMIJ_INLINE void itoa_body16_pad(char* out, uint64_t value,
 
 // Writes 32 ASCII digits: `mid` at out[0,16) then `low` at out[16,32), both
 // zero-padded. Mirrors the SSE4.1 (non-AVX2) two-chunk itoa_body32_pad.
-ZMIJ_INLINE void itoa_body32_pad(char* out, uint64_t mid, uint64_t low,
+__attribute__((noinline)) static void itoa_body32_pad(char* out, uint64_t mid, uint64_t low,
                                  const data& d) noexcept {
   itoa_body16_pad(out, mid, d);
   itoa_body16_pad(out + 16, low, d);
@@ -1601,7 +1609,7 @@ ZMIJ_INLINE auto to_bcd16x2_256(uint64_t a, uint64_t b,
 // noinline on the AVX2: compilers perform additional stack adjustment which
 // pessimizes the speed of the other cases otherwise.
 #  if defined(__AVX2__)
-__attribute__((noinline)) static void itoa_body32_pad(char* out, uint64_t mid,
+ZMIJ_NOINLINE static void itoa_body32_pad(char* out, uint64_t mid,
     uint64_t low, const data& d) noexcept {
   __m256i bcd = to_bcd16x2_256(mid, low, d);  // lane0 = mid, lane1 = low
   __m256i shuffle =
@@ -1648,26 +1656,33 @@ ZMIJ_INLINE void itoa_body32_pad(char* dst, uint64_t mid, uint64_t low,
   itoa_body16_pad(dst + 16, low, d);
 }
 
-// Left-aligns a 16-wide field (leading-zero padded) by dropping lz
-// leading zeroes.
-ZMIJ_INLINE auto drop_leading_zeroes(__m128i x, int lz) noexcept -> __m128i {
-  // Coarse stage: when lz >= 8, discard the low 8 bytes first.
-  __m128i x8 = _mm_srli_si128(x, 8);
-  __m128i sel = _mm_set1_epi32(-((lz >> 3) & 1));  // all-ones iff lz >= 8
-  x = _mm_or_si128(_mm_and_si128(sel, x8), _mm_andnot_si128(sel, x));
-  // Fine stage: right shift the 128-bit value by r = (lz & 7) * 8 bits (< 64).
-  int r = (lz & 7) << 3;
-  __m128i lo = _mm_srl_epi64(x, _mm_cvtsi32_si128(r));
-  __m128i carry = _mm_sll_epi64(_mm_srli_si128(x, 8), _mm_cvtsi32_si128(64 - r));
-  return _mm_or_si128(lo, carry);
+// A left-aligned 16-digit field as its two little-endian 64-bit halves, ready
+// for two 8-byte stores.
+struct ascii16 { uint64_t lo, hi; };
+
+// Left-aligns a 16-wide field (leading-zero padded) by dropping lz leading
+// zeroes. The significant tail occupies the low 16 - lz bytes, so the
+// left-align is a right shift of the whole 128-bit value by lz bytes.
+ZMIJ_INLINE auto drop_leading_zeroes(__m128i x, int lz) noexcept -> ascii16 {
+  // Extract the two halves (x is already ASCII-biased by to_ascii16) and
+  // left-align by right-shifting the full 128-bit value by lz bytes in GPRs.
+  // Both gcc and clang lower the __int128 shift to a branchless shrd + shr +
+  // cmov -- cheaper than the SSE2 srl/sll/or chain and, unlike a hand-rolled
+  // two-shift funnel, needs no mask-blend for the coarse >= 64 step. lz is in
+  // [0, 15] so the shift stays < 128 bits.
+  uint64_t lo = uint64_t(_mm_cvtsi128_si64(x));
+  uint64_t hi = uint64_t(_mm_cvtsi128_si64(_mm_unpackhi_epi64(x, x)));
+  unsigned __int128 full = (static_cast<unsigned __int128>(hi) << 64) | lo;
+  full >>= unsigned(lz) * 8;  // lz bytes -> bits
+  return {uint64_t(full), uint64_t(full >> 64)};
 }
 
 ZMIJ_INLINE char* itoa_body(char* out, uint64_t value, int len,
                             const data& d) noexcept {
   int leading_zeroes = 16 - len;
-  __m128i ascii = to_ascii16(value, d);
-  _mm_storeu_si128(reinterpret_cast<__m128i*>(out),
-                   drop_leading_zeroes(ascii, leading_zeroes));
+  ascii16 r = drop_leading_zeroes(to_ascii16(value, d), leading_zeroes);
+  memcpy(out, &r.lo, 8);
+  memcpy(out + 8, &r.hi, 8);
   return out + len;
 }
 
@@ -1675,13 +1690,13 @@ ZMIJ_INLINE char* itoa_body(char* out, uint64_t value, int len,
 
 #if ZMIJ_USE_INT128
 ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char*;
-#else
+#else  // ZMIJ_USE_INT128
 // Ensure we get a linker error if for some reason itoa_u128 ends up being
 // called.  No uint128_t type is guaranteed to exist in this case, so this
 // is a template which doesn't have to rely on implicit promotion of the
 // arguments.
 template <typename T> auto itoa_u128(T value, char* out) noexcept -> char*;
-#endif
+#endif  // ZMIJ_USE_INT128
 
 // Writes the decimal representation of unsigned value to out. Minimum buffer
 // sizes: u32 -> 16, u64 -> 20, u128 -> 48 bytes (+1 for the sign in the signed
@@ -1697,7 +1712,7 @@ ZMIJ_INLINE auto itoa(UInt value, char* out) noexcept -> char* {
     if (sizeof(UInt) <= 4) {
 #if ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
       return itoa_body10(out, v, count_digits(uint32_t(v)), *d);
-#else
+#else  // ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
       uint32_t high = uint32_t(v / 100);  // <= 8 digits
       uint64_t hi = to_bcd8(high).bcd + zeros;
       uint32_t low2 = uint32_t(v) - high * 100;
@@ -1710,7 +1725,7 @@ ZMIJ_INLINE auto itoa(UInt value, char* out) noexcept -> char* {
       out[len_hi] = d2[0];
       out[len - 1] = d2[1]; // if len == 1 overwrites d2[0]
       return out + len;
-#endif
+#endif  // ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
     } else {
 #if ZMIJ_USE_SSE || ZMIJ_USE_NEON
       // We peel off the last four digits and always write them at the end,
@@ -1725,7 +1740,7 @@ ZMIJ_INLINE auto itoa(UInt value, char* out) noexcept -> char* {
       memcpy(p, digits2(low4 / 100), 2);
       memcpy(p + 2, digits2(low4 % 100), 2);
       return p + 4 * big;   // The trailing digits only count if they aren't redundant.
-#else
+#else  // ZMIJ_USE_SSE || ZMIJ_USE_NEON
       // u64: at most 20 digits -> three groups (top, mid 8, low 8). The top
       // group is v / 1e16 in [0, 1844], at most 4 digits, so divmod100 + two
       // digits2 lookups beat a full to_bcd8. Right-aligned, those 4 bytes land
@@ -1745,54 +1760,27 @@ ZMIJ_INLINE auto itoa(UInt value, char* out) noexcept -> char* {
       int len = count_digits(v);
       memcpy(out, buf + 24 - len, 20);
       return out + len;
-#endif
+#endif  // ZMIJ_USE_SSE || ZMIJ_USE_NEON
     }
   }
 }
 
-// std::make_unsigned is ill-formed for __int128 in strict-conformance mode
-// (it's not a standard integer type), so map it here. The specialization sits
-// behind ZMIJ_USE_INT128, which is 0 on toolchains without __int128 (e.g. MSVC),
-// so the primary template handles 32/64-bit there.
-template <typename Int>
-struct itoa_make_unsigned {
-  using type = typename std::make_unsigned<Int>::type;
-};
 #if ZMIJ_USE_INT128
-template <>
-struct itoa_make_unsigned<__int128> {
-  using type = unsigned __int128;
-};
+// gcc and clang need some handholding.  The combination of ZMIJ_NOINLINE here
+// ZMIJ_UNLIKELY in itoa_signed and ZMIJ_NOINLINE on itoa_body32_pad turned out
+// to be the best compromise with neither compiler regressing >10% on some
+// benchmarks.
+#if ZMIJ_USE_SSE && !ZMIJ_USE_SSE4_1
+ZMIJ_NOINLINE
+#else
+ZMIJ_INLINE
 #endif
-
-// Writes the decimal representation of signed `value`, prefixing '-' when
-// negative. Branchless so a random sign pattern can't mispredict: the sign mask
-// is 0 (non-negative) or all-ones (negative); mag is the overflow-safe absolute
-// value and the '-' is written unconditionally, advancing only when negative.
-template <typename Int>
-ZMIJ_INLINE auto itoa_signed(Int value, char* out) noexcept -> char* {
-  using UInt = typename itoa_make_unsigned<Int>::type;
-  UInt s = UInt(value >> (sizeof(Int) * 8 - 1));
-  UInt mag = (UInt(value) ^ s) - s;
-  *out = '-';
-  out += s & 1;
-  return itoa(mag, out);
-}
-
-#if ZMIJ_USE_INT128
-// A u128 holds 20-39 digits. Values <= u64 delegate to the u64 path (realistic
-// data is overwhelmingly small, so this branch is well predicted). Otherwise
-// peel 16 decimal digits at a time with a 128-bit reciprocal: one peel leaves a
-// 20-32 digit value (top <=16 + low 16); two peels leave 33-39 (top <=7 +
-// mid 16 + low 16). The two interior chunks are fixed-width; only the top trims
-// leading zeros via itoa_body. See PLAN_u128.md / [[project_itoa_chainbreak]].
-ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char* {
-  if (value <= UINT64_MAX) return itoa(uint64_t(value), out);
+auto itoa_u128_wide(uint128_t value, char* out) noexcept -> char* {
 #if ZMIJ_USE_SSE || ZMIJ_USE_NEON  // SSE4.1/SSE2/NEON share the chunked body.
   const auto* d = &static_data;
   ZMIJ_ASM(("" : "+r"(d)));  // Load constants from memory.
   divrem_1e16_result lo = divrem_1e16(value);  // lo.rem = digits [0, 16)
-  if (lo.quot < uint64_t(1e16)) {   // 20-32 digits: top (<=16) + low
+  if (lo.quot < uint64_t(1e16)) {   // 19-32 digits: top (<=16) + low
     // Two separate 128-bit BCD passes, NOT a shared 256-bit one. The shared form
     // (one to_bcd16x2_256, per-lane trim, two stores) measured slower (clang
     // ~6%, g++ ~8%) even with the OR-with-'0' hoisted off the length chain: it's
@@ -1810,7 +1798,7 @@ ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char* {
   char* p = itoa_body(out, top, count_digits(uint32_t(top)), *d);
   itoa_body32_pad(p, hi.rem, lo.rem, *d);
   return p + 32;
-#else
+#else // ZMIJ_USE_SSE || ZMIJ_USE_NEON
   // Scalar mirror of the SSE path: peel 16 digits per step with the GM
   // reciprocal (avoids the __udivti3 libcall a u128 %/÷ constant would emit) and
   // build each 16-digit chunk as two fixed-width 8-digit to_bcd8 words (MSB
@@ -1821,7 +1809,7 @@ ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char* {
   divrem_1e16_result lo = divrem_1e16(value);  // lo.rem = low 16 digits
   uint64_t low_hi = to_bcd8(uint32_t(lo.rem / 100'000'000ull)).bcd + zeros;
   uint64_t low_lo = to_bcd8(uint32_t(lo.rem % 100'000'000ull)).bcd + zeros;
-  if (lo.quot < 10'000'000'000'000'000ull) {  // 20-32 digits: top (<=16) + low 16
+  if (lo.quot < 10'000'000'000'000'000ull) {  // 19-32 digits: top (<=16) + low 16
     uint64_t top = uint64_t(lo.quot);
     char buf[48] = {};
     uint64_t top_hi = to_bcd8(uint32_t(top / 100'000'000ull)).bcd + zeros;
@@ -1851,7 +1839,60 @@ ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char* {
   int len = 32 + count_digits(top);
   memcpy(out, buf + 48 - len, 40);
   return out + len;
-#endif  // ZMIJ_USE_SSE
+#endif // ZMIJ_USE_SSE || ZMIJ_USE_NEON
+}
+#endif // ZMIJ_USE_INT128
+
+// std::make_unsigned is ill-formed for __int128 in strict-conformance mode
+// (it's not a standard integer type), so map it here. The specialization sits
+// behind ZMIJ_USE_INT128, which is 0 on toolchains without __int128 (e.g. MSVC),
+// so the primary template handles 32/64-bit there.
+template <typename Int>
+struct itoa_make_unsigned {
+  using type = typename std::make_unsigned<Int>::type;
+};
+#if ZMIJ_USE_INT128
+template <>
+struct itoa_make_unsigned<__int128> {
+  using type = unsigned __int128;
+};
+#endif // ZMIJ_USE_INT128
+
+// Write the decimal representation of signed value.
+template <typename Int>
+ZMIJ_INLINE auto itoa_signed(Int value, char* out) noexcept -> char* {
+#if ZMIJ_USE_INT128
+  // If possible, use the 64bit path.  The 128x128 multiplications required for
+  // the full width are more expensive than branching.
+  if (sizeof(Int) > 8) {
+    if (value == Int(int64_t(value))) [[ZMIJ_LIKELY]] {
+      return itoa_signed(int64_t(value), out);
+    } else [[ZMIJ_UNLIKELY]] {
+      using UInt = typename itoa_make_unsigned<Int>::type;
+      UInt mag = value >= 0 ? UInt(value) : -UInt(value);
+      *out = '-';
+      out += value < 0;
+      return itoa_u128_wide(mag, out);
+    }
+  }
+#endif
+  using UInt = typename itoa_make_unsigned<Int>::type;
+  UInt mag = value >= 0 ? UInt(value) : -UInt(value);
+  *out = '-';
+  out += value < 0;
+  return itoa(mag, out);
+}
+
+#if ZMIJ_USE_INT128
+// A u128 holds 20-39 digits. Values <= u64 delegate to the u64 path (realistic
+// data is overwhelmingly small, so this branch is well predicted). Otherwise
+// peel 16 decimal digits at a time with a 128-bit reciprocal: one peel leaves a
+// 19-32 digit value (top <=16 + low 16); two peels leave 33-39 (top <=7 +
+// mid 16 + low 16). The two interior chunks are fixed-width; only the top trims
+// leading zeros via itoa_body. See PLAN_u128.md / [[project_itoa_chainbreak]].
+ZMIJ_INLINE auto itoa_u128(uint128_t value, char* out) noexcept -> char* {
+  if (value <= UINT64_MAX) return itoa(uint64_t(value), out);
+  return itoa_u128_wide(value, out);
 }
 #endif  // ZMIJ_USE_INT128
 
