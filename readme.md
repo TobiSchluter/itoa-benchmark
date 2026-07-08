@@ -1,19 +1,28 @@
-# itoa Benchmark
+# itoa Benchmark with zmij-based branchfree algorithms
 
 A fork of [Milo Yip's itoa-benchmark](https://github.com/miloyip/itoa-benchmark)
 that was used to develop the **branch-free itoa algorithms** based on the BCD
 (binary-coded decimal) conversion code found in
-[zmij](https://github.com/vitaut/zmij).  On data with numbers of varying magnitude
-these are the fastest codes that I am aware of.
+[zmij](https://github.com/vitaut/zmij).  These are among the fastest codes,
+if not the fastest codes for general purpose integer-to-string conversion.
 
-The new entries appear in the roster four times, a scalar fallback `zmij_scalar` and
-SIMD variants optimized for the various x64 microarchitecture levels: `zmij_sse2` (v1),
-`zmij_sse41` (v2), and `zmij_avx2` (v3).  Notably, even the
-non-SIMD `zmij_scalar` variant is competitive with the fastest branchy
-implementations simply because branches are so expensive: on realistic
-(mixed-length) data, what dominates is not arithmetic but branch
-mispredictions.  The zmij algorithms have no branches and thus no
-mispredictions.
+The code supports both aarch64 using NEON intrinsics and amd64 with specialized
+implementations for the microarchitecture levels v1 (SSE2), v2 (SSE4.1), and v3
+(AVX2).  We also have a scalar fallback, that uses SWAR[^swar] techniques to
+implement the same branch-free techniques.
+
+We will describe some of the new features of this benchmark and why previous
+versions of `itoa-benchmark` proved inadequate in the following.  For each
+benchmark that we introduce we show a representative sample plot that illustrates
+the results.  These are busy plots as we included the full set of algorithms
+included in `itoa-benchmark` together with our new ones.  Ours are easy to find
+though, as in most cases the cluster near the faster end of the time axis.
+
+We always show the scalar implementation, `zmij-scalar`, and depending on the
+system used for each benchmark either `zmij-neon` (test run on an M5 MacBook Pro,
+using clang) or the various amd64 microarchitecture levels `zmij_sse2` (v1),
+`zmij_sse41` (v2), and `zmij_avx2` (v3) (run on an AMD Ryzen CPU which has a
+Zen5 core, with g++16).
 
 Besides the new algorithms, this fork adds to the original benchmark:
 
@@ -22,15 +31,15 @@ Besides the new algorithms, this fork adds to the original benchmark:
 * **128-bit integers** (`__int128`), see [below](#128-bit-support).
 * **New benchmark modes** that control the digit-length distribution of the
   input — the heart of this fork, explained in the following sections.
-* variable data sample length to study the impact of the large branch
+* Variable data sample length to study the impact of the large branch
   prediction buffers in CPUs.
 * An ABBA/interleaved measurement engine (each implementation is timed over
   the same dataset in alternating roster order, minimum over rounds) to cancel
   turbo/thermal drift.
 
-All plots below were measured on an AMD Zen 5 core (g++-16); the full set,
-including the 64-bit and 128-bit variants of each mode, is in
-[result/plots_zen5](result/plots_zen5).
+The full sets of plots, including the 32-bit 64-bit and 128-bit variants of each
+mode, are in [result/plots_zen5](result/plots_zen5) and [results/plot_m5](results/plots_m5),
+respectively.
 
 ## The problem: benchmarking with perfect branch prediction
 
@@ -60,17 +69,17 @@ under test, and the benchmark evaluates the marginal cost of the fixed-length
 half (measure the combined stream, subtract the noise-only baseline). This
 fork implements the same algorithm as the `unpredictable` mode.
 
-The name promises more than it delivers, though. Since the fixed-length half
-plus its share of the noise means that over half of the combined stream
-(~55% for 32-bit) has the length under test, any length-based jump will
-actually predict quite well — the predictor simply biases toward the length
+The name promises more than it delivers, though. Since the fixed-length acocunts
+for half of the test data, more than half of the combined stream
+(~55% for 32-bit) has the length under test.   Thus any length-based jump will
+actually predict quite well, the predictor simply biases toward the length
 under test.  And if an implementation resolves the length through a cascade
 of branches, the later jumps predict even better: if each branch divides the
 remaining data set in half based on length then the first branch will be 55%
 predictable, the second branch 83%, and so on.[^1]  So while this test does
 reflect some kinds of data, it is not as unpredictable as it may seem.
 
-![unpredictable, 32-bit](result/plots_zen5/unpredictable_32.png)
+![unpredictable, 32-bit](result/plots_m5/unpredictable_64.png)
 
 In spite of these caveats, zmij carves out a win.
 
@@ -93,7 +102,9 @@ Two things stand out:
   straddles one of their branch boundaries would produce the same hump —
   `--admix` lets you choose the pair.)
 * For the algorithms that do branch between 5 and 6 digits the impact is
-  clear: at 50% probability they lose roughly 3.5 ns per mispredicted jump.
+  clear: at 50% probability they lose on average 3.5ns, i.e. 7ns per
+  mispredicted jump.  On the M5 (not shown), the loss per jump is approximately
+  8ns.
 
 The branch prediction in CPUs relies on memorizing the jump sequences taken
 by the code.  For too small data sets even these random sets of data are
@@ -117,7 +128,7 @@ implementation, and it does so by a distance.  Numbers that span the
 whole range are probably seldom enough to dimiss this as artificial, so we
 also show the restriction to numbers with one to four digits.
 
-![loguniform 1–4 digits, 32-bit](result/plots_zen5/loguniform_32_1_4.png)
+![loguniform 1–4 digits, 32-bit](result/plots_m5/loguniform_64_1_4.png)
 
 Again, zmij is at the top.  In the case where a 64 bit integer between one
 and four digits is input (not shown), `amartin` and `yy` beat the zmij's
@@ -149,7 +160,7 @@ standard formatter for these, so [{fmt}](https://github.com/fmtlib/fmt)
 (`fmt::format_to`) serves as the reference; most implementations in the
 roster do not provide 128-bit conversion and are skipped for that width:
 
-![bylength, 128-bit](result/plots_zen5/bylength_128.png)
+![bylength, 128-bit](result/plots_m5/bylength_128.png)
 
 For 128-bit types the admixture mode gains extra sweeps (`straddle64`,
 `straddle1e32`) that mix values just below and just above zmij's internal
@@ -168,7 +179,7 @@ make PRESET=clang21        # same, with clang++-21
 make plots                 # regenerate PNGs from the CSV
 ~~~~~~~~
 
-Or drive CMake directly:
+Or drive CMake directly: 
 
 ~~~~~~~~sh
 cmake --preset gcc16
@@ -199,6 +210,10 @@ Useful driver options (`itoa --help`):
 * [zmij](https://github.com/vitaut/zmij) — the BCD conversion codes that were
   reused in the `zmij-*` algorithms in this benchmark.
 
+[^swar]: SWAR = SIMD Within A Register, a technique to process multiple
+data items simultaneously without using SIMD (Single Instruction Multiple
+Data) operations.
+
 [^1]: If we are using ten bins of data, then the `unpredictable`
 benchmark will distribute the data such that the bin under test contains
 55% of the data and the other bins 5% each.  If we assume for simplicity
@@ -206,10 +221,10 @@ a jump cascade that excludes half the range at each step, then in the first
 step, 75% of the data will lie on the side where the test data is found, and
 25% will lie on the other side.  So this jump will be predicted correctly
 75% of the time.  The 25% on the other side remain equidistributed and
-unpredictable, but on the side where we are testing, we have five bins.
-Four contain 5% of the data, and one that contains 55%.  In the next step
-we again divide into two equal groups (which is not possible based on digit
-counts, but we ignore that for the sake of argument).  On the one side of
-the dividing line we have 5×5% / 2 = 12.5% of the data, on the other side
-50% + 5×5% / 2 = 62.5%.  This branch will be predicted correctly 62.5% / 75%
-= 83% of the time.  And so on.
+unpredictable, but on the side where we are testing, the data are distributed
+unevenly.  We have five bins.  Four contain 5% of the total data, and one
+contains 55%.  In the next step we again divide into two equal groups (which
+is not possible based on digit counts, but we ignore that for the sake of
+argument).  On one side of the dividing line we have 5×5% / 2 = 12.5% of
+the data, on the other side 50% + 5×5% / 2 = 62.5%.  A branch choosing between
+these will be predicted correctly 62.5% / 75% = 83% of the time.  And so on.
