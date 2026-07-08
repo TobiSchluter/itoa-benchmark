@@ -23,10 +23,22 @@
         "CMAKE_BUILD_TYPE": "Release",
         "ITOA_NATIVE": "ON"
       }
+    },
+    {
+      "name": "mac",
+      "displayName": "Apple clang (native, AArch64)",
+      "binaryDir": "${sourceDir}/build/mac",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_BUILD_TYPE": "Release",
+        "ITOA_NATIVE": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "gcc16",   "configurePreset": "gcc16" },
-    { "name": "clang21", "configurePreset": "clang21" }
+    { "name": "clang21", "configurePreset": "clang21" },
+    { "name": "mac",     "configurePreset": "mac" }
   ]
 }

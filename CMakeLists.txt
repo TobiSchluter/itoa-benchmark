@@ -55,7 +55,7 @@ endif()
 file(GLOB ITOA_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 # The zmij variant TUs are compiled separately, each pinned to its own
 # microarchitecture level (below), so keep them out of the -march=native target.
-list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|sse2|sse41|avx2))\\.cpp$")
+list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|sse2|sse41|avx2|neon))\\.cpp$")
 
 add_executable(itoa ${ITOA_SOURCES})
 target_include_directories(itoa PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -89,10 +89,20 @@ function(add_zmij_variant name arch)
     target_link_libraries(itoa PRIVATE ${name})
 endfunction()
 
-add_zmij_variant(zmij_scalar -march=x86-64)
-add_zmij_variant(zmij_sse2   -march=x86-64)
-add_zmij_variant(zmij_sse41  -march=x86-64-v2)
-add_zmij_variant(zmij_avx2   -march=x86-64-v3)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+    if(ITOA_NATIVE)
+        add_zmij_variant(zmij_scalar -march=native)
+        add_zmij_variant(zmij_neon   -march=native)
+    else()
+        add_zmij_variant(zmij_scalar "")
+        add_zmij_variant(zmij_neon   "")
+    endif()
+else()
+    add_zmij_variant(zmij_scalar -march=x86-64)
+    add_zmij_variant(zmij_sse2   -march=x86-64)
+    add_zmij_variant(zmij_sse41  -march=x86-64-v2)
+    add_zmij_variant(zmij_avx2   -march=x86-64-v3)
+endif()
 
 # The benchmark reads/writes ./result relative to the working dir; run from build.
 set_target_properties(itoa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
