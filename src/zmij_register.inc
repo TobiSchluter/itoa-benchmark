@@ -25,7 +25,24 @@
 
 void ZMIJ_FN(u32toa)(uint32_t v, char* b)   { *ZMIJ_NS::detail::itoa(v, b) = '\0'; }
 void ZMIJ_FN(i32toa)(int32_t v, char* b)    { *ZMIJ_NS::detail::itoa_signed(v, b) = '\0'; }
+#ifdef ZMIJ_U64_FITS_DISPATCH
+// Route small u64 values through the cheaper u32 kernel (one 16-byte store,
+// single reciprocal group) instead of the u64 two-chunk path. Any threshold
+// <= 2^32 is correct (uint32_t(v) == v there). A power-of-10 threshold keeps
+// every digit-length class on one side of the branch (no straddle -> no
+// per-length misprediction); 2^32 itself sits inside the 10-digit range.
+#  ifndef ZMIJ_U64_FITS_THRESHOLD
+#    define ZMIJ_U64_FITS_THRESHOLD 4294967296ull  // 2^32
+#  endif
+void ZMIJ_FN(u64toa)(uint64_t v, char* b) {
+  char* e = v < ZMIJ_U64_FITS_THRESHOLD
+                ? ZMIJ_NS::detail::itoa(uint32_t(v), b)
+                : ZMIJ_NS::detail::itoa(v, b);
+  *e = '\0';
+}
+#else
 void ZMIJ_FN(u64toa)(uint64_t v, char* b)   { *ZMIJ_NS::detail::itoa(v, b) = '\0'; }
+#endif
 void ZMIJ_FN(i64toa)(int64_t v, char* b)    { *ZMIJ_NS::detail::itoa_signed(v, b) = '\0'; }
 void ZMIJ_FN(u128toa)(uint128_t v, char* b) { *ZMIJ_NS::detail::itoa(v, b) = '\0'; }
 void ZMIJ_FN(i128toa)(int128_t v, char* b)  { *ZMIJ_NS::detail::itoa_signed((__int128)v, b) = '\0'; }

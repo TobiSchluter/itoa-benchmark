@@ -38,7 +38,7 @@ Besides the new algorithms, this fork adds to the original benchmark:
   turbo/thermal drift.
 
 The full sets of plots, including the 32-bit 64-bit and 128-bit variants of each
-mode, are in [result/plots_zen5](result/plots_zen5) and [results/plot_m5](results/plots_m5),
+mode, are in [result/plots_zen5/gcc16](result/plots_zen5/gcc16) and [result/plots_m5](result/plots_m5),
 respectively.
 
 ## The problem: benchmarking with perfect branch prediction
@@ -55,7 +55,7 @@ This mode is kept as `bylength`.  It is the predictable best case, and it can
 give a lower bound of evaluation time, but no estimate for the performance
 under non-pathological realistic workloads.
 
-![bylength, 32-bit](result/plots_zen5/bylength_32.png)
+![bylength, 32-bit](result/plots_zen5/gcc16/bylength_32.png)
 
 Even in this case the zmij algorithms are fast enough to be competitive, and
 they are the fastest for long digit strings.
@@ -91,7 +91,7 @@ To demonstrate the effect of branch prediction directly, this fork adds the
 pure ends predict perfectly; a 50/50 mix maximizes mispredictions on any
 branch separating the two lengths:
 
-![admixture 5×6, 32-bit](result/plots_zen5/admixture_32_5x6.png)
+![admixture 5×6, 32-bit](result/plots_zen5/gcc16/admixture_32_5x6.png)
 
 Two things stand out:
 
@@ -121,7 +121,7 @@ over a configurable window of lengths. No length dominates, so no length-based
 branch gets to be well-predicted.  Instead of scanning over the number of
 digits this amortizes over the whole range of lengths tested.
 
-![loguniform 1–10 digits, 32-bit](result/plots_zen5/loguniform_32_1_10.png)
+![loguniform 1–10 digits, 32-bit](result/plots_zen5/gcc16/loguniform_32_1_10.png)
 
 Every zmij variant — including the scalar, non-SIMD one — beats every branchy
 implementation, and it does so by a distance.  Numbers that span the
@@ -147,7 +147,7 @@ and then looks up the string corresponding to its lowest eight bits in a 256
 entry table.  This algorithm is so fast that in the benchmark run used to
 create the plots it actually beat the do-nothing (`null`) version.
 
-![uniform 0–255, 32-bit](result/plots_zen5/uniform_32_0_255.png)
+![uniform 0–255, 32-bit](result/plots_zen5/gcc16/uniform_32_0_255.png)
 
 Of the general algorithms again zmij comes out at top.  The `tmueller`
 algorithm is almost as fast, but even the fallback `zmij_scalar` beats

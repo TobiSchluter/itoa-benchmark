@@ -10,13 +10,10 @@ src/machine.h
 # CMake build trees (one per compiler preset) and fetched deps
 /build/
 /build/*
+/build-*/
 
 # Python venv for plotting, caches, and generated plots
 /.venv/
 __pycache__/
 *.pyc
-/result/plots/
-/plots/
 
-# Benchmark output CSVs
-*.csv

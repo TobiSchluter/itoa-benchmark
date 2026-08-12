@@ -96,7 +96,9 @@ template <> struct Traits<uint64_t> {
     static uint64_t Max() { return UINT64_MAX; }
 };
 template <> struct Traits<int64_t> {
-    enum { kBufferSize = 32, kMaxDigit = 19, kSigned = 1 };
+    // 33, not 32: the zmij fold-pair path stores a fixed 32 bytes from the
+    // first digit, and the sign shifts that window to out + 33.
+    enum { kBufferSize = 33, kMaxDigit = 19, kSigned = 1 };
     static const char* Name() { return "i64"; }
     static uint128_t MaxMagnitude() { return INT64_MAX; }
     static int64_t Min() { return INT64_MIN; }
@@ -392,7 +394,22 @@ static std::vector<double> InterleavedMeasure(const std::vector<FuncEntry<T>>& f
                                               const Config& cfg) {
     const size_t n = data.size();
     const unsigned passes = (unsigned)std::max<uint64_t>(1, cfg.passTarget / std::max<size_t>(1, n));
-    char buffer[Traits<T>::kBufferSize];
+    // The output buffer's low 12 address bits pick 4K-aliasing victims: a store
+    // that lands (mod 4096) just below a load whose address slides with the
+    // digit count (e.g. zmij's count_digits table) makes exactly that digit
+    // length ~5 cycles slower. A fixed stack buffer inherits those bits from
+    // env/stack luck, so single lengths spike at random per process. Rotating
+    // the offset *within* a timed block doesn't dilute the hazard either: one
+    // colliding stretch trains the memory-disambiguation predictor and the
+    // load stays demoted long after the offset moves on. So page-align the
+    // buffer and give each ABBA round one fixed offset, spread across the
+    // page: a hazard window (~50 bytes) catches at most one round, and the
+    // min-over-rounds estimator discards that round like any other outlier.
+    // Offsets are 64-byte aligned so every store stays cache-line-contained
+    // and clear of the page end.
+    static_assert(Traits<T>::kBufferSize <= 64, "offset step assumes <= 64");
+    alignas(4096) char buffer[4096];
+    const size_t offsetStride = (4096 / cfg.rounds) & ~size_t(63);
     std::vector<double> best(fns.size(), std::numeric_limits<double>::max());
 
     // Warm-up: touch every function once over the dataset (untimed) so the first
@@ -406,6 +423,7 @@ static std::vector<double> InterleavedMeasure(const std::vector<FuncEntry<T>>& f
 
     for (unsigned r = 0; r < cfg.rounds; r++) {
         const bool forward = (r % 2 == 0);
+        char* out = buffer + r * offsetStride % 4096;
         for (size_t j = 0; j < fns.size(); j++) {
             const size_t i = forward ? j : (fns.size() - 1 - j);
             void (*f)(T, char*) = fns[i].fn;
@@ -414,8 +432,8 @@ static std::vector<double> InterleavedMeasure(const std::vector<FuncEntry<T>>& f
             auto t0 = std::chrono::steady_clock::now();
             for (unsigned p = 0; p < passes; p++) {
                 for (size_t k = 0; k < n; k++)
-                    f(data[k], buffer);
-                Escape(buffer);
+                    f(data[k], out);
+                Escape(out);
             }
             auto t1 = std::chrono::steady_clock::now();
 

@@ -47,22 +47,48 @@ def load(path):
     return rows
 
 
+# Canonical function order: colours (and zmij markers) are assigned by NAME
+# from this list, so every subset -- --only runs, the straddle drops, digest
+# CSVs -- draws each function in the same colour as the full set. Functions
+# not listed here get stable colours after the known ones, in sorted order.
+KNOWN_FUNCTIONS = [
+    "amartin", "branchlut", "branchlut2", "count", "countlut", "fmt",
+    "jeaiii", "lut", "mwilson", "naive", "null", "sprintf", "sse2",
+    "tmueller", "toy256", "unnamed", "unrolledlut", "yy",
+    "zmij_scalar", "zmij_x64_v1", "zmij_x64_v2", "zmij_x64_v3",
+    "zmij_x64_v4", "zmij_x64_native", "zmij_neon",
+]
+
+
+def _canonical(functions):
+    known = [fn for fn in KNOWN_FUNCTIONS if fn in functions]
+    return known + sorted(set(functions) - set(KNOWN_FUNCTIONS))
+
+
 def color_map(functions):
-    funcs = sorted(functions)
-    # tab20 + tab20b give 40 distinguishable colours (we have ~21 functions).
+    # tab20 + tab20b give 40 distinguishable colours (we have ~25 functions).
     base = (matplotlib.colormaps["tab20"].colors
             + matplotlib.colormaps["tab20b"].colors)
-    return {fn: base[i % len(base)] for i, fn in enumerate(funcs)}
+    unknown = sorted(set(functions) - set(KNOWN_FUNCTIONS))
+    def idx(fn):
+        if fn in KNOWN_FUNCTIONS:
+            return KNOWN_FUNCTIONS.index(fn)
+        return len(KNOWN_FUNCTIONS) + unknown.index(fn)
+    return {fn: base[idx(fn) % len(base)] for fn in functions}
 
 
-# Distinct filled marker shapes, cycled per function on top of colour so lines
-# stay tellable apart in dense plots (and in print / greyscale).
+# Distinct filled marker shapes on top of colour. Only the zmij lines get
+# markers, so they stand out against the competitor field (and stay tellable
+# apart from each other in print / greyscale).
 _MARKERS = ["o", "s", "^", "v", "D", "P", "X", "*", "<", ">", "p", "h", "H", "d", "8"]
 
 
 def marker_map(functions):
-    funcs = sorted(functions)
-    return {fn: _MARKERS[i % len(_MARKERS)] for i, fn in enumerate(funcs)}
+    markers = {fn: None for fn in functions}
+    zmij = [fn for fn in _canonical(functions) if fn.startswith("zmij")]
+    for i, fn in enumerate(zmij):
+        markers[fn] = _MARKERS[i % len(_MARKERS)]
+    return markers
 
 
 def clean_style():
@@ -100,7 +126,7 @@ def subset(rows, mode, typ, series):
     return out
 
 
-def plot_line(rows, mode, wc_name, types, series, colors, markers, outdir, logy):
+def plot_line(rows, mode, wc_name, types, series, colors, markers, outdir, logy, suffix=""):
     present = [t for t in types if any(
         r["Type"] == t and r["Mode"] == mode and r["Series"] == series for r in rows)]
     if not present:
@@ -154,14 +180,14 @@ def plot_line(rows, mode, wc_name, types, series, colors, markers, outdir, logy)
     fig.tight_layout(rect=(0, 0, 0.86, 1))
 
     tag = series.replace("x", "x").replace("-", "_") if series else ""
-    name = f"{mode}_{wc_name.split('-')[0]}" + (f"_{tag}" if tag else "")
+    name = f"{mode}_{wc_name.split('-')[0]}" + (f"_{tag}" if tag else "") + suffix
     path = os.path.join(outdir, name + ".png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
     print("wrote", path)
 
 
-def plot_bars(rows, mode, wc_name, types, series, colors, outdir):
+def plot_bars(rows, mode, wc_name, types, series, colors, outdir, suffix=""):
     """loguniform: one bar per function (single point) per type."""
     present = [t for t in types if any(
         r["Type"] == t and r["Mode"] == mode and r["Series"] == series for r in rows)]
@@ -184,7 +210,7 @@ def plot_bars(rows, mode, wc_name, types, series, colors, outdir):
     fig.suptitle(f"{MODE_TITLES.get(mode, mode)}  —  {wc_name}  [{series}]",
                  fontsize=11)
     fig.tight_layout()
-    name = f"{mode}_{wc_name.split('-')[0]}_{series.replace('-', '_')}"
+    name = f"{mode}_{wc_name.split('-')[0]}_{series.replace('-', '_')}" + suffix
     path = os.path.join(outdir, name + ".png")
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
@@ -198,6 +224,9 @@ def main():
     ap.add_argument("--exclude", default="sprintf",
                     help="comma-separated functions to drop everywhere (default: sprintf)")
     ap.add_argument("--only", default="", help="comma-separated functions to keep")
+    ap.add_argument("--suffix", default="",
+                    help="appended to every output filename (e.g. _zmij for "
+                         "an --only zmij subset written next to the full set)")
     ap.add_argument("--exclude-small", default="naive",
                     help="functions to drop from 32/64-bit plots only "
                          "(kept on 128-bit); default: naive")
@@ -230,16 +259,16 @@ def main():
                 wc_rows = [r for r in rows if r["Function"] not in excl_small]
             for series in series_for(wc_rows, mode, types):
                 if mode in ("loguniform", "uniform"):
-                    plot_bars(wc_rows, mode, wc_name, types, series, colors, outdir)
+                    plot_bars(wc_rows, mode, wc_name, types, series, colors, outdir, args.suffix)
                 else:
-                    # bylength/unpredictable are linear at 32/64-bit; 128-bit
-                    # keeps log, where the naive baseline dominates the range.
-                    # The straddle sweeps drop fmt/naive (see plot_line), so their
-                    # zmij-only range is tight -- linear shows the additive branch
+                    # bylength/unpredictable are linear at 32/64-bit. The full
+                    # 128-bit set keeps log, where the naive baseline dominates
+                    # the range. The zmij-only subset (--suffix) drops fmt/naive,
+                    # so its range is tight -- linear shows the additive branch
                     # bump far better than log.
                     is_128 = wc_name.startswith("128")
-                    logy = mode in ("bylength", "unpredictable") and is_128
-                    plot_line(wc_rows, mode, wc_name, types, series, colors, markers, outdir, logy)
+                    logy = mode in ("bylength", "unpredictable") and is_128 and not args.suffix
+                    plot_line(wc_rows, mode, wc_name, types, series, colors, markers, outdir, logy, args.suffix)
 
     print("\nDone. PNGs in", outdir)
 
