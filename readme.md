@@ -18,11 +18,12 @@ the results.  These are busy plots as we included the full set of algorithms
 included in `itoa-benchmark` together with our new ones.  Ours are easy to find
 though, as in most cases the cluster near the faster end of the time axis.
 
-We always show the scalar implementation, `zmij-scalar`, and depending on the
-system used for each benchmark either `zmij-neon` (test run on an M5 MacBook Pro,
-using clang) or the various amd64 microarchitecture levels `zmij_sse2` (v1),
-`zmij_sse41` (v2), and `zmij_avx2` (v3) (run on an AMD Ryzen CPU which has a
-Zen5 core, with g++16).
+We always show the scalar implementation, `zmij_scalar`, and depending on the
+system used for each benchmark either `zmij_neon` (test run on an M5 MacBook Pro,
+using clang) or the various amd64 microarchitecture levels `zmij_v1` (SSE2),
+`zmij_v2` (SSE4.1), and `zmij_v3` (AVX2) (run on an AMD Ryzen CPU which has a
+Zen5 core, with g++16).  All plots are available in the [results](result)
+subdirectory.
 
 Besides the new algorithms, this fork adds to the original benchmark:
 
@@ -38,8 +39,8 @@ Besides the new algorithms, this fork adds to the original benchmark:
   turbo/thermal drift.
 
 The full sets of plots, including the 32-bit 64-bit and 128-bit variants of each
-mode, are in [result/plots_zen5/gcc16](result/plots_zen5/gcc16) and [result/plots_m5](result/plots_m5),
-respectively.
+mode, are in [result/plots_zen5/](result/plots_zen5/) and [result/plots_m5](result/plots_m5),
+respectively.  The Zen5 plots are avaialable from builds with GCC 16 and clang 21.
 
 ## The problem: benchmarking with perfect branch prediction
 
@@ -56,6 +57,8 @@ give a lower bound of evaluation time, but no estimate for the performance
 under non-pathological realistic workloads.
 
 ![bylength, 32-bit](result/plots_zen5/gcc16/bylength_32.png)
+*Shown: Zen5/gcc16.  Same plot: [Zen5/clang21](result/plots_zen5/clang21/bylength_32.png),
+[M5](result/plots_m5/bylength_32.png)*
 
 Even in this case the zmij algorithms are fast enough to be competitive, and
 they are the fastest for long digit strings.
@@ -80,6 +83,8 @@ predictable, the second branch 83%, and so on.[^1]  So while this test does
 reflect some kinds of data, it is not as unpredictable as it may seem.
 
 ![unpredictable, 32-bit](result/plots_m5/unpredictable_64.png)
+*Shown: M5.  Same plot: [Zen5/gcc16](result/plots_zen5/gcc16/unpredictable_64.png),
+[Zen5/clang21](result/plots_zen5/clang21/unpredictable_64.png)*
 
 In spite of these caveats, zmij carves out a win.
 
@@ -92,6 +97,8 @@ pure ends predict perfectly; a 50/50 mix maximizes mispredictions on any
 branch separating the two lengths:
 
 ![admixture 5×6, 32-bit](result/plots_zen5/gcc16/admixture_32_5x6.png)
+*Shown: Zen5/gcc16.  Same plot: [Zen5/clang21](result/plots_zen5/clang21/admixture_32_5x6.png),
+[M5](result/plots_m5/admixture_32_5x6.png)*
 
 Two things stand out:
 
@@ -122,6 +129,8 @@ branch gets to be well-predicted.  Instead of scanning over the number of
 digits this amortizes over the whole range of lengths tested.
 
 ![loguniform 1–10 digits, 32-bit](result/plots_zen5/gcc16/loguniform_32_1_10.png)
+*Shown: Zen5/gcc16.  Same plot: [Zen5/clang21](result/plots_zen5/clang21/loguniform_32_1_10.png),
+[M5](result/plots_m5/loguniform_32_1_10.png)*
 
 Every zmij variant — including the scalar, non-SIMD one — beats every branchy
 implementation, and it does so by a distance.  Numbers that span the
@@ -129,9 +138,11 @@ whole range are probably seldom enough to dimiss this as artificial, so we
 also show the restriction to numbers with one to four digits.
 
 ![loguniform 1–4 digits, 32-bit](result/plots_m5/loguniform_64_1_4.png)
+*Shown: M5.  Same plot: [Zen5/gcc16](result/plots_zen5/gcc16/loguniform_64_1_4.png),
+[Zen5/clang21](result/plots_zen5/clang21/loguniform_64_1_4.png)*
 
 Again, zmij is at the top.  In the case where a 64 bit integer between one
-and four digits is input (not shown), `amartin` and `yy` beat the zmij's
+and four digits is input (not shown), `tmueller` and `yy` beat the zmij's
 `scalar` fallback algorithms, but the SIMD variants come out at top.
 
 
@@ -148,10 +159,12 @@ entry table.  This algorithm is so fast that in the benchmark run used to
 create the plots it actually beat the do-nothing (`null`) version.
 
 ![uniform 0–255, 32-bit](result/plots_zen5/gcc16/uniform_32_0_255.png)
+*Shown: Zen5/gcc16.  Same plot: [Zen5/clang21](result/plots_zen5/clang21/uniform_32_0_255.png),
+[M5](result/plots_m5/uniform_32_0_255.png)*
 
 Of the general algorithms again zmij comes out at top.  The `tmueller`
-algorithm is almost as fast, but even the fallback `zmij_scalar` beats
-eveything else.
+algorithm beats the v1 (SSE2) version, but even the fallback `zmij_scalar`
+beats everything else.
 
 ## 128-bit support
 
@@ -161,6 +174,8 @@ standard formatter for these, so [{fmt}](https://github.com/fmtlib/fmt)
 roster do not provide 128-bit conversion and are skipped for that width:
 
 ![bylength, 128-bit](result/plots_m5/bylength_128.png)
+*Shown: M5.  Same plot: [Zen5/gcc16](result/plots_zen5/gcc16/bylength_128.png),
+[Zen5/clang21](result/plots_zen5/clang21/bylength_128.png)*
 
 For 128-bit types the admixture mode gains extra sweeps (`straddle64`,
 `straddle1e32`) that mix values just below and just above zmij's internal
@@ -202,13 +217,13 @@ Useful driver options (`itoa --help`):
 
 ## Credits
 
-* [Milo Yip's original itoa-benchmark](https://github.com/miloyip/itoa-benchmark)
-  — benchmark framework and most of the implementations in the roster (see
+* [Milo Yip's original itoa-benchmark](https://github.com/miloyip/itoa-benchmark):
+  benchmark framework and most of the implementations in the roster (see
   the original readme for descriptions of the individual algorithms).
-* [dtolnay's Rust variation](https://github.com/dtolnay/itoa-benchmark) — the
+* [dtolnay's Rust variation](https://github.com/dtolnay/itoa-benchmark): the
   unpredictable-mode algorithm.
-* [zmij](https://github.com/vitaut/zmij) — the BCD conversion codes that were
-  reused in the `zmij-*` algorithms in this benchmark.
+* [zmij](https://github.com/vitaut/zmij): the BCD conversion codes that were
+  adapted for the `zmij-*` algorithms in this benchmark.
 
 [^swar]: SWAR = SIMD Within A Register, a technique to process multiple
 data items simultaneously without using SIMD (Single Instruction Multiple

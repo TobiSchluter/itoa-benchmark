@@ -221,8 +221,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--outdir", default=None)
-    ap.add_argument("--exclude", default="sprintf",
-                    help="comma-separated functions to drop everywhere (default: sprintf)")
+    ap.add_argument("--exclude", default="sprintf,zmij_x64_v4,zmij_x64_native",
+                    help="comma-separated functions to drop everywhere; ignored "
+                         "when --only is given (default: sprintf plus the v4/"
+                         "native zmij tiers, which crowd the full plots)")
     ap.add_argument("--only", default="", help="comma-separated functions to keep")
     ap.add_argument("--suffix", default="",
                     help="appended to every output filename (e.g. _zmij for "
@@ -235,10 +237,13 @@ def main():
     rows = load(args.csv)
     excl = {s for s in args.exclude.split(",") if s}
     only = {s for s in args.only.split(",") if s}
-    if excl:
-        rows = [r for r in rows if r["Function"] not in excl]
+    # --only is authoritative: an explicit keep-list re-includes functions the
+    # (default) exclude list would drop, e.g. the v4/native tiers in the
+    # _zmij subset.
     if only:
         rows = [r for r in rows if r["Function"] in only]
+    elif excl:
+        rows = [r for r in rows if r["Function"] not in excl]
 
     outdir = args.outdir or os.path.join(os.path.dirname(os.path.abspath(args.csv)), "plots")
     os.makedirs(outdir, exist_ok=True)

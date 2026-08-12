@@ -39,12 +39,12 @@ $(PY):
 venv: $(PY)
 
 # Functions kept in the _zmij subset plots: the zmij variants plus the
-# imported Champagne-Lemire rows.
-ZMIJ_PLOT_ONLY := zmij_scalar,zmij_x64_v1,zmij_x64_v2,zmij_x64_v3,zmij_x64_v4,zmij_x64_native
+# null baseline.
+ZMIJ_PLOT_ONLY := null,zmij_scalar,zmij_x64_v1,zmij_x64_v2,zmij_x64_v3,zmij_x64_v4,zmij_x64_native
 
 plots: $(PY)
-	$(PY) plot_results.py $(CSV) --outdir result/plots/$(PRESET)
-	$(PY) plot_results.py $(CSV) --outdir result/plots/$(PRESET) --suffix _zmij --only $(ZMIJ_PLOT_ONLY)
+	$(PY) plot_results.py $(CSV) --outdir result/plots_zen5/$(PRESET)
+	$(PY) plot_results.py $(CSV) --outdir result/plots_zen5/$(PRESET) --suffix _zmij --only $(ZMIJ_PLOT_ONLY)
 
 clean:
 	rm -rf build/$(PRESET)
