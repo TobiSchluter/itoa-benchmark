@@ -1024,6 +1024,12 @@ struct data {
        '0', '0'},
       {'-', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0',
        '0', '0'}};
+  // u128 wide-path constants: the 128-bit /1e16 reciprocal (hi, lo), the
+  // second peel's 5^16 reciprocal (ceil(2^96 / 5^16)), and 1e16 itself --
+  // loaded instead of mov/movk-materialized (~15 instructions per wide
+  // call). Plain ldrs: the head's ldp range is fully occupied.
+  uint64_t u128_consts[4] = {0x39a5652fb1137856, 0xd30baf9a1e626a6d,
+                             0x734aca5f6226f0b, 10000000000000000};
 #endif
 
   // Shuffle indices for SIMD digit shift. Offset 0 = identity, offset 1 =
@@ -1726,11 +1732,22 @@ struct divmod_1e16_result {
   uint128_t quot;
   uint64_t rem;
 };
-ZMIJ_INLINE auto divmod_1e16(uint128_t n) noexcept -> divmod_1e16_result {
+ZMIJ_INLINE auto divmod_1e16(uint128_t n,
+                             [[ZMIJ_MAYBE_UNUSED]] const data& d) noexcept
+    -> divmod_1e16_result {
+#if ZMIJ_USE_NEON
+  // The constants come from static_data (see u128_consts); materializing
+  // them costs mov + 3 movk apiece.
+  const uint128_t magic =
+      (uint128_t(d.u128_consts[0]) << 64) | d.u128_consts[1];
+  uint128_t q = mulhi128(n, magic) >> 51;
+  return {q, uint64_t(n - q * d.u128_consts[3])};
+#else
   const uint128_t magic =
       (uint128_t(0x39a5652fb1137856ull) << 64) | 0xd30baf9a1e626a6dull;
   uint128_t q = mulhi128(n, magic) >> 51;
   return {q, uint64_t(n - q * uint64_t(1e16))};
+#endif
 }
 
 // Divmod by 1e16 for the second peel: n = value / 1e16 < 2**75, so with
@@ -1742,13 +1759,22 @@ struct divmod_1e16_narrow_result {
   uint64_t rem;
 };
 
-ZMIJ_INLINE auto divmod_1e16_narrow(uint128_t n) noexcept
+ZMIJ_INLINE auto divmod_1e16_narrow(uint128_t n,
+                                    [[ZMIJ_MAYBE_UNUSED]] const data& d) noexcept
     -> divmod_1e16_narrow_result {
+#if ZMIJ_USE_NEON
+  uint32_t q =
+      uint32_t(umul128_hi64(uint64_t(n >> 16), d.u128_consts[2]) >> 32);
+  // Remainder is evaluated mod 2**64; quot is <= 7 digits, so uint32_t holds
+  // it and every consumer gets the cheaper 32-bit count_digits.
+  return {q, uint64_t(n) - q * d.u128_consts[3]};
+#else
   constexpr uint64_t div5p16_sig = 0x734aca5f6226f0b;  // ceil(2**96 / 5**16)
   uint32_t q = uint32_t(umul128_hi64(uint64_t(n >> 16), div5p16_sig) >> 32);
   // Remainder is evaluated mod 2**64; quot is <= 7 digits, so uint32_t holds
   // it and every consumer gets the cheaper 32-bit count_digits.
   return {q, uint64_t(n) - q * uint64_t(1e16)};
+#endif
 }
 #endif
 
@@ -2266,7 +2292,7 @@ auto itoa_u128_wide(uint128_t value, char* out) noexcept -> char* {
   if (!ZMIJ_USE_SSE && !ZMIJ_USE_NEON) {
     // Mirrors the SIMD paths, but we have to move in 8-digit blocks.
     bool big = value >= uint128_t(uint64_t(1e16)) * uint64_t(1e16);  // >= 1e32
-    divmod_1e16_result lo = divmod_1e16(value);  // lo.rem = low 16 digits
+    divmod_1e16_result lo = divmod_1e16(value, *d);  // lo.rem = low 16 digits
     uint64_t low_hi = to_bcd8(lo.rem / 100'000'000ull).bcd + zeros;
     uint64_t low_lo = to_bcd8(lo.rem % 100'000'000ull).bcd + zeros;
     // No zero-init: unwritten bytes are only ever copied into the scratch
@@ -2287,7 +2313,7 @@ auto itoa_u128_wide(uint128_t value, char* out) noexcept -> char* {
       return out + len;
     }
     // 33-39 digits: top (<=7) + mid 16 + low 16.
-    divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot);  // hi.rem = mid 16, hi.quot = top
+    divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot, *d);  // hi.rem = mid 16, hi.quot = top
     uint32_t top = hi.quot;
     uint64_t mid = hi.rem;
     // top is <= 7 digits, so one to_bcd8 covers it.
@@ -2302,8 +2328,14 @@ auto itoa_u128_wide(uint128_t value, char* out) noexcept -> char* {
     return out + len;
   }
 #if ZMIJ_USE_SSE || ZMIJ_USE_NEON
-  divmod_1e16_result lo = divmod_1e16(value);  // lo.rem = digits [0, 16)
-  if (lo.quot < uint64_t(1e16)) {   // 19-32 digits: top (<=16) + low
+  divmod_1e16_result lo = divmod_1e16(value, *d);  // lo.rem = digits [0, 16)
+#if ZMIJ_USE_NEON
+  // Same 1e16 the divmod just loaded, so the compare reuses the register.
+  uint64_t ten16 = d->u128_consts[3];
+#else
+  uint64_t ten16 = uint64_t(1e16);
+#endif
+  if (lo.quot < uint128_t(ten16)) {   // 19-32 digits: top (<=16) + low
     uint64_t q = uint64_t(lo.quot);
 #if ZMIJ_USE_AVX2
     // Fuse the trimmed head (q) and the fixed low chunk into one 256-bit pass,
@@ -2316,7 +2348,7 @@ auto itoa_u128_wide(uint128_t value, char* out) noexcept -> char* {
     return p + 16;
 #endif
   }
-  divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot);  // hi.rem = digits [16, 32); hi.quot = top (<=7)
+  divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot, *d);  // hi.rem = digits [16, 32); hi.quot = top (<=7)
 #if ZMIJ_USE_AVX2
   char* p = itoa_top8(out, hi.quot, count_digits(hi.quot, *d), *d);
 #else
