@@ -1,10 +1,49 @@
+# Converting an integer to a string in less than one nanosecond
+
+Integer conversion happens practically every time two computers talk to each
+other or when they display data to the user.  That user-id?  An integer.
+That post you're replying to?  Identified by an integer.  The number of bytes
+the other side should wait for?  Another integer.  The timestamp?  An
+integer.  Your IP address?  Four integers.  Date and time?  Displayed as
+integers.  Conversion of integers to strings (also called `itoa` after the
+old C library call for that purpose) happens everywhere all the time and
+every CPU cycle saved improves someone's day.
+
+This repository was used to develop and benchmark a new class of branchfree
+integer conversion codes which show exceptional performance independent of
+the size of the number.  Where more classical implementations loop over the
+digits or branch based on the number of digits, we treat the digits in one
+go leveraging SIMD instructions and the fact that many digits fit inside the
+wide register of modern CPUs totally avoiding the expensive branches that
+slow down other approaches.  Additionally, since we materialize the final
+string directly in the output memory location and evaluate the length of the
+output in parallel, the out-of-order capabilities of today's CPUs can be
+brought to full use.  The calling program knows where to continue writing
+early and so it can continue while the digits may still be making their way
+into the CPU's L1 cache, thus minimizing the time each conversion adds to
+the program's execution time.
+
+These codes were developed based on the conversion code originally
+contributed to [zmij](https://github.com/vitaut/zmij), the fastest library
+for float-to-string conversion.  The problem set is different for integers,
+and so while we retain the SIMD core, there's a lot of new code, giving us
+what is probably the fastest library for converting typical integer workloads
+to strings.
+
+The title alludes to [Champagne Gareau and Lemire's paper](https://onlinelibrary.wiley.com/doi/epdf/10.1002/spe.70079?msockid=1d720e4d021d666c29981b3703796782)
+where they use AVX-512 instructions to great effect.  While we don't yet
+include AVX-512 implementations, and they use branches that work well with
+their benchmarks, our implementation on Apple Silicon (M5) does indeed
+convert `int32_t` in less than a nanosecond, using all but 32 machine
+instructions and no branches.  A proper comparison is `unsigned long` which
+clocks in at 1.5ns and 49 instructions with our codes.  These times include
+a benchmark overhead that is measured to about 0.65ns, so in that sense also
+converting an `int64_t` takes less than a nanosecond.
+
 # itoa Benchmark with zmij-based branchfree algorithms
 
-A fork of [Milo Yip's itoa-benchmark](https://github.com/miloyip/itoa-benchmark)
-that was used to develop the **branch-free itoa algorithms** based on the BCD
-(binary-coded decimal) conversion code found in
-[zmij](https://github.com/vitaut/zmij).  These are among the fastest codes,
-if not the fastest codes for general purpose integer-to-string conversion.
+This repository is a fork of [Milo Yip's itoa-benchmark](https://github.com/miloyip/itoa-benchmark),
+which was enhanced to give a more realistic sampling of the pitfalls of .
 
 The code supports both aarch64 using NEON intrinsics and amd64 with specialized
 implementations for the microarchitecture levels v1 (SSE2), v2 (SSE4.1), and v3
