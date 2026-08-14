@@ -765,23 +765,27 @@ inline auto write_if(char* buffer, uint32_t digit, bool condition) noexcept
 #endif
 
 struct count_digits_tables {
+#if !ZMIJ_USE_NEON
+  // Fused form valid only for n < 1e16 (< 2^54): each entry is
+  // (estimate << 54) - threshold, so a single 64-bit add + `>> 54` yields the
+  // digit count, the power-of-10 compare folded into the add's carry. First
+  // member; on NEON the equivalent rows live at the front of `data` instead
+  // (see inc_lt1e16_rows).
+  uint64_t inc_lt1e16[65] = {};
+#endif
   // Digit-count estimate of a 64-bit value by MSB position, plus the
   // power-of-ten thresholds (indexed by estimate) deciding the -1 correction.
-  uint8_t estimate[64] = {};
+  // Row 64 serves n == 0 on the defined-at-zero clz form (never indexed by
+  // the bsr form).
+  uint8_t estimate[65] = {};
 #if ZMIJ_OPTIMIZE_SIZE
   // Correction thresholds indexed by the digit estimate.
   uint64_t pow10[21] = {};
 #else
   // Correction threshold indexed by the leading-zero index rather than by the
   // digit estimate.
-  uint64_t threshold[64] = {};
+  uint64_t threshold[65] = {};
 #endif
-  // Fused form valid only for n < 1e16 (< 2^54): each entry is
-  // (estimate << 54) - threshold, so a single 64-bit add + `>> 54` yields the
-  // digit count, the power-of-10 compare folded into the add's carry.
-  // This is used for digit estimations of 32bit numbers as well as the u64 and
-  // u128 paths where we split of enough digits to land in the range.
-  uint64_t inc_lt1e16[64] = {};
 
 private:
   // Table index of an entry by MSB position.
@@ -792,7 +796,19 @@ private:
 public:
   // Table index for a value.
   static auto index_of(uint64_t n) noexcept -> uint64_t {
-    return ZMIJ_COUNT_DIGITS_BSR ? clz(n | 1) ^ 63 : clz(n | 1);
+#if ZMIJ_COUNT_DIGITS_BSR
+    // bsr is undefined at zero; the | 1 makes it legal and ^ 63 cancels the
+    // clz lowering back into the plain bsr result.
+    return clz(n | 1) ^ 63;
+#elif ZMIJ_HAS_BUILTIN(__builtin_clzg)
+    // The hardware count is defined at zero (lzcnt / ARM clz return 64) and
+    // row 64 covers it, so no | 1 is needed.
+    return unsigned(__builtin_clzg(n, 64));
+#elif ZMIJ_MSC_VER && ZMIJ_X86_64
+    return __lzcnt64(n);  // BSR == 0 on MSVC x64 implies AVX2, so lzcnt exists
+#else
+    return clz(n | 1);
+#endif
   }
 
   constexpr count_digits_tables() {
@@ -806,12 +822,42 @@ public:
       int t = 1;  // digit count of max_val
       while (t < 20 && max_val >= p10[t]) ++t;
       estimate[index64(b)] = uint8_t(t);
+#if !ZMIJ_USE_NEON
       if (b < 54)  // n < 1e16 => MSB <= 53
         inc_lt1e16[index64(b)] = (uint64_t(t) << 54) - (t > 1 ? p10[t - 1] : 0);
+#endif
 #if !ZMIJ_OPTIMIZE_SIZE
       threshold[index64(b)] = t > 1 ? p10[t - 1] : 0;
 #endif
     }
+    // Row 64: n == 0 under the defined-at-zero clz form. One digit, no
+    // correction (threshold[64] stays 0 from the initializer).
+    estimate[64] = 1;
+#if !ZMIJ_USE_NEON
+    inc_lt1e16[64] = uint64_t(1) << 54;
+#endif
+  }
+};
+
+// The NEON layout stores only rows 10..64: the index -- a leading-zero count
+// of a value below 2^54 (or 64 for zero) -- never goes below 10, and the
+// entry load wants byte offset index * 8 straight off the pinned data
+// pointer (one scaled register-offset ldr, no address add), so rows 0..9 are
+// dead space that data's scalar-constant head occupies instead.
+struct inc_lt1e16_rows {
+  uint64_t rows[55] = {};
+
+  constexpr inc_lt1e16_rows() {
+    uint64_t p10[20] = {1};  // 10^i, i in [0, 19]
+    for (int i = 1; i < 20; ++i) p10[i] = p10[i - 1] * 10;
+    for (int b = 0; b < 54; ++b) {  // n < 1e16 => MSB <= 53, index 63 - b >= 10
+      uint64_t max_val = (uint64_t(2) << b) - 1;
+      int t = 1;  // digit count of max_val
+      while (t < 20 && max_val >= p10[t]) ++t;
+      rows[63 - b - 10] = (uint64_t(t) << 54) - (t > 1 ? p10[t - 1] : 0);
+    }
+    // Row 64: n == 0 under the defined-at-zero clz form (one digit).
+    rows[64 - 10] = uint64_t(1) << 54;
   }
 };
 
@@ -831,10 +877,6 @@ struct data {
            u64(d) << 24 | u64(c) << 16 | u64(b) << +8 | u64(a);
   }
 
-  ZMIJ_CONST_DECL uint64_t threshold = 1e15;
-  // +6 is needed for boundary cases found by verify.py.
-  ZMIJ_CONST_DECL uint64_t biased_half = (uint64_t(1) << 63) + 6;
-
 #if ZMIJ_USE_NEON
   static constexpr int32_t neg10k = 0x10000 - 10000;
 
@@ -843,11 +885,36 @@ struct data {
   using int16x8 = std::conditional_t<ZMIJ_MSC_VER != 0 || ZMIJ_NEON2SSE_SHIM,
                                      int16_t[8], int16x8_t>;
 
+  // Scalar-constant head, exactly 80 bytes: it occupies the dead rows 0..9
+  // of the fused count_digits table that follows (see inc_lt1e16_rows), and
+  // staying under byte 80 keeps every pair inside ldp immediate range.
+  // mul_const and neg1e8 are adjacent for the itoa head's single ldp.
   uint64_t mul_const = 0xabcc77118461cefd;
-  uint64_t hundred_million = 100000000;
+  // (1 << 32) - 1e8: one madd packs a value's base-1e8 divmod as
+  // remainder | quotient << 32 (see to_unshuffled_digits_itoa).
+  uint64_t neg1e8 = (uint64_t(1) << 32) - 100000000;
+  // u64toa head constants, paired for one ldp: the full-range /1e4 umulh
+  // reciprocal (post-shift 11, the compiler's own magic) and the 16-digit
+  // threshold 1e16 - 1.
+  uint64_t u64toa_consts[2] = {0x346dc5d63886594b, 9999999999999999};
   int32x4 multipliers32 = {div10k_sig, neg10k, div100_sig << 12, neg100};
   int16x8 multipliers16 = {0xce0, neg10};
-#elif ZMIJ_USE_SSE
+  // Full-range u32 /100 reciprocal (ceil(2^37 / 100), shift 37) paired with
+  // the divisor so the u64 path's digits2 tail gets both from one ldp.
+  uint32_t div100_full[2] = {0x51EB851F, 100};
+  uint64_t hundred_million = 100000000;
+  // Rows 10..64 of the fused count table, at byte offset 80 == 10 * 8.
+  inc_lt1e16_rows inc_rows;
+
+  ZMIJ_CONST_DECL uint64_t threshold = 1e15;
+  // +6 is needed for boundary cases found by verify.py.
+  ZMIJ_CONST_DECL uint64_t biased_half = (uint64_t(1) << 63) + 6;
+#else
+  ZMIJ_CONST_DECL uint64_t threshold = 1e15;
+  // +6 is needed for boundary cases found by verify.py.
+  ZMIJ_CONST_DECL uint64_t biased_half = (uint64_t(1) << 63) + 6;
+#endif
+#if ZMIJ_USE_SSE
   // Ordered so that the values used to format floats fit in a single cache
   // line.
   uint128 div100 = splat32(div100_sig);
@@ -937,18 +1004,26 @@ struct data {
 #endif
 
 #if ZMIJ_USE_NEON
-  // Reverse-and-left-align shuffle for integer output, the NEON analogue of the
-  // SSE4.1 revalign_shuffle. The NEON BCD from to_unshuffled_digits is stored
-  // high-lane-first with each 64-bit lane's bytes in LSD-first order, so the
-  // first 16 entries are the per-lane reversal {7..0, 15..8} that vrev64q_u8
-  // performs -- folding that reversal into the shuffle drops a separate rev.
-  // Indexing at offset `lz` (leading-zero count) additionally drops `lz` leading
-  // zeros; offset 0 is a pure reversal (used by itoa_body16_pad). Indices >= 16
-  // (0x80) emit a zero byte past the last significant digit.
+  // Reverse-and-left-align shuffle for integer output. The BCD from
+  // to_unshuffled_digits_itoa is LSD-first across the whole vector (byte b =
+  // digit 15 - b), so the first 16 entries are the plain descending run;
+  // indexing at offset `lz` (leading-zero count) reverses while dropping `lz`
+  // leading zeros, and offset 0 is a pure reversal (used by itoa_body16_pad).
+  // Indices >= 16 (0x80) emit a zero byte past the last significant digit.
   alignas(32) unsigned char revalign_shuffle[31] = {
-      7,    6,    5,    4,    3,    2,    1,    0,    15,   14,  13,
-      12,   11,   10,   9,    8,    0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+      15,   14,   13,   12,   11,   10,   9,    8,    7,    6,   5,
+      4,    3,    2,    1,    0,    0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
       0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+  // Post-shuffle bias for itoa_i32, row-selected by neg: negatives get '-'
+  // on byte 0 (which holds a padded BCD leading zero after the widened
+  // shuffle window) and '0' on the digits. Two 16-byte rows rather than a
+  // 17-byte sliding pair so the row address is neg << 4 off the base and the
+  // struct offset folds into the load's scaled immediate.
+  alignas(32) unsigned char sign_bias[2][16] = {
+      {'0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0',
+       '0', '0'},
+      {'-', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0', '0',
+       '0', '0'}};
 #endif
 
   // Shuffle indices for SIMD digit shift. Offset 0 = identity, offset 1 =
@@ -967,6 +1042,18 @@ struct data {
 
 };
 alignas(64) constexpr data static_data;
+#if ZMIJ_USE_NEON
+// count_digits_lt_1e16 loads the fused count entry from byte offset
+// index * 8 of `data` itself; the index (a leading-zero count of n < 2^54,
+// or 64 for zero) is never below 10, and the scalar head must exactly fill
+// those dead rows so stored row 0 lands in unreachable row 10's slot.
+static_assert(offsetof(data, inc_rows) == 10 * sizeof(uint64_t),
+              "scalar head must end exactly at the count table's row 10");
+static_assert(offsetof(data, inc_rows) +
+                      sizeof(inc_lt1e16_rows::rows) ==
+                  65 * sizeof(uint64_t),
+              "stored rows must cover count indices 10..64");
+#endif
 
 #if ZMIJ_USE_NEON
 
@@ -1182,7 +1269,16 @@ ZMIJ_INLINE auto count_digits_lt_1e16(uint64_t n, const data& d) noexcept
     -> uint64_t {
   assert(n < uint64_t(1e16));
   uint64_t i = count_digits_tables::index_of(n);
+#if ZMIJ_USE_NEON
+  // Entry at byte offset i * 8 off the data pointer itself: i >= 10 always
+  // (n < 2^54), and data's scalar head occupies rows 0..9's space, so the
+  // load is one scaled register-offset ldr with no address add.
+  uint64_t inc;
+  memcpy(&inc, reinterpret_cast<const char*>(&d) + i * 8, sizeof(inc));
+  return (n + inc) >> 54;
+#else
   return (n + d.cd_tables.inc_lt1e16[i]) >> 54;
+#endif
 }
 
 // Number of decimal digits in a 32-bit n (1 for n == 0). Every uint32_t is
@@ -1657,11 +1753,38 @@ ZMIJ_INLINE auto divmod_1e16_narrow(uint128_t n) noexcept
 #endif
 
 #if ZMIJ_USE_NEON
+// to_unshuffled_digits with the base-1e8 split packed by one madd -- value +
+// ((1 << 32) - 1e8) * (value / 1e8) = remainder | quotient << 32 -- placing
+// the low 8-digit group in lane 0. The BCD bytes then come out LSD-first
+// across the whole vector (byte b = digit 15 - b), matching
+// revalign_shuffle's descending windows. The float path keeps
+// to_unshuffled_digits: its consumers depend on the high-group-first layout.
+ZMIJ_INLINE auto to_unshuffled_digits_itoa(uint64_t value, const data& d)
+    -> uint8x16_t {
+  uint64_t abcdefgh = uint64_t(umul128(value, d.mul_const) >> 90);
+  uint64_t packed = value + d.neg1e8 * abcdefgh;
+  // Compiler barrier, or clang unpairs the 64-bit pack into vector inserts.
+  ZMIJ_ASM(("" : "+r"(packed)));
+  int32x2_t ijklmnop_abcdefgh = vreinterpret_s32_u64(vcreate_u64(packed));
+
+  int32x2_t ijkl_abcd = vreinterpret_s32_u32(
+      vshr_n_u32(vreinterpret_u32_s32(
+                     vqdmulh_n_s32(ijklmnop_abcdefgh, d.multipliers32[0])),
+                 9));
+  int32x2_t mnop_ijkl_efgh_abcd_32 =
+      vmla_n_s32(ijklmnop_abcdefgh, ijkl_abcd, d.multipliers32[1]);
+
+  int32x4_t mnop_ijkl_efgh_abcd = vreinterpretq_s32_u32(
+      vshll_n_u16(vreinterpret_u16_s32(mnop_ijkl_efgh_abcd_32), 0));
+  return to_bcd_4x4(mnop_ijkl_efgh_abcd, d);
+}
+
 // Build the 16-wide BCD of value in [0, 1e16), convert to ASCII, and
 // apply shuffle.
 ZMIJ_INLINE auto to_ascii16_and_shuffle(uint64_t value, uint8x16_t shuffle,
                                         const data& d) noexcept -> uint8x16_t {
-  uint8x16_t ascii = vaddq_u8(to_unshuffled_digits(value, d), vdupq_n_u8('0'));
+  uint8x16_t ascii =
+      vaddq_u8(to_unshuffled_digits_itoa(value, d), vdupq_n_u8('0'));
   return vqtbl1q_u8(ascii, shuffle);
 }
 
@@ -1681,11 +1804,27 @@ ZMIJ_INLINE char* itoa_body(char* out, uint64_t value, uint64_t len,
   return out + len;
 }
 
-// No narrow 32-bit kernel on NEON (the SSE4.1 SWAR-pack diet is unmeasured
-// here); the 32-bit entry forwards to the 16-digit body.
+// No narrow 32-bit kernel on NEON (the SSE4.1 SWAR-pack diet measured
+// exact instruction-count and time parity with this route on the M5); the
+// 32-bit entry forwards to the 16-digit body.
 ZMIJ_INLINE char* itoa_body10(char* out, uint32_t value, uint64_t len,
                               const data& d) noexcept {
   return itoa_body(out, uint64_t(value), len, d);
+}
+
+// Signed 32-bit body folding the '-' into the single 16-byte store: the
+// shuffle window is widened by one for negatives (byte 0 then holds a padded
+// BCD leading zero), and the post-shuffle bias -- sign_bias at offset
+// 1 - neg -- turns that zero into '-' while biasing the digits with '0'.
+ZMIJ_INLINE char* itoa_i32(int32_t value, char* out, const data& d) noexcept {
+  uint32_t mag = value >= 0 ? uint32_t(value) : -uint32_t(value);
+  uint64_t neg = value < 0;
+  uint64_t chars = count_digits(mag, d) + neg;
+  uint8x16_t shuffle = vld1q_u8(d.revalign_shuffle + (16 - chars));
+  uint8x16_t bias = vld1q_u8(d.sign_bias[neg]);
+  vst1q_u8(reinterpret_cast<uint8_t*>(out),
+           vaddq_u8(vqtbl1q_u8(to_unshuffled_digits_itoa(mag, d), shuffle), bias));
+  return out + chars;
 }
 
 // Writes exactly 16 ASCII digits of `value` in [0, 1e16) at `out`, zero-padded,
@@ -2031,6 +2170,21 @@ ZMIJ_INLINE auto itoa(UInt value, char* __restrict out) noexcept -> char* {
       // but if the number is < 10000 we don't move them around but instead
       // fill them into the SIMD kernel.  This benchmarked fastest out of
       // the variations that I tried.
+#  if ZMIJ_USE_NEON
+      // The big constants (the /1e4 umulh reciprocal, the 1e16 - 1 threshold
+      // and the tail's /100 pair) load from static_data ldp pairs; letting
+      // the compiler materialize them costs seven mov/movk and, measured on
+      // the M5, ~a cycle per call.
+      uint64_t high = umul128_hi64(v, d->u64toa_consts[0]) >> 11;
+      uint64_t big = v > d->u64toa_consts[1];
+      uint32_t low4 = uint32_t(v - high * 10000);
+      uint64_t body = big ? high : v;  // body < 1e16 either way
+      char* p = itoa_body(out, body, count_digits_lt_1e16(body, *d), *d);
+      uint32_t low4_hi = uint32_t((uint64_t(low4) * d->div100_full[0]) >> 37);
+      memcpy(p, digits2(low4_hi), 2);
+      memcpy(p + 2, digits2(low4 - low4_hi * d->div100_full[1]), 2);
+      return p + 4 * big;   // The trailing digits only count if they aren't redundant.
+#  else
       uint64_t high = v / 10000;
       uint32_t low4 = uint32_t(v - high * 10000);
       uint64_t big = v >= uint64_t(1e16);
@@ -2039,6 +2193,7 @@ ZMIJ_INLINE auto itoa(UInt value, char* __restrict out) noexcept -> char* {
       memcpy(p, digits2(low4 / 100), 2);
       memcpy(p + 2, digits2(low4 % 100), 2);
       return p + 4 * big;   // The trailing digits only count if they aren't redundant.
+#  endif  // ZMIJ_USE_NEON
 #else
       // u64: at most 20 digits -> three groups (top, mid 8, low 8). The top
       // group is v / 1e16 in [0, 1844], at most 4 digits, so divmod100 + two
@@ -2207,6 +2362,13 @@ ZMIJ_INLINE auto itoa_signed(Int value, char* out) noexcept -> char* {
   }
 #endif
   using UInt = typename itoa_make_unsigned<Int>::type;
+#if ZMIJ_USE_NEON
+  if (sizeof(Int) <= 4) {
+    const auto* d = &static_data;
+    ZMIJ_ASM(("" : "+r"(d)));  // Load constants from memory.
+    return itoa_i32(int32_t(value), out, *d);
+  }
+#endif
   UInt mag = value >= 0 ? UInt(value) : -UInt(value);
   *out = '-';
   out += value < 0;
