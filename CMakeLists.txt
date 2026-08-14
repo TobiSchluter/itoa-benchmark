@@ -90,17 +90,21 @@ function(add_zmij_variant name arch)
     add_library(${name} OBJECT "${CMAKE_SOURCE_DIR}/src/${name}.cpp")
     target_include_directories(${name} PRIVATE "${CMAKE_SOURCE_DIR}/src")
     target_compile_definitions(${name} PRIVATE __STDC_FORMAT_MACROS=1 NDEBUG)
-    target_compile_options(${name} PRIVATE -O3 ${arch})
+    # Fixed function alignment so A/B comparisons between variants are not
+    # skewed by fetch-group luck (arm64 clang only 4-byte-aligns functions;
+    # byte-identical entry points have measured ~1 cycle/call apart from
+    # start-offset alone).
+    target_compile_options(${name} PRIVATE -O3 -falign-functions=64 ${arch})
     target_link_libraries(itoa PRIVATE ${name})
 endfunction()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
     if(ITOA_NATIVE)
-        add_zmij_variant(zmij_scalar -march=native)
-        add_zmij_variant(zmij_neon   -march=native)
+        add_zmij_variant(zmij_scalar  -march=native)
+        add_zmij_variant(zmij_neon    -march=native)
     else()
-        add_zmij_variant(zmij_scalar "")
-        add_zmij_variant(zmij_neon   "")
+        add_zmij_variant(zmij_scalar  "")
+        add_zmij_variant(zmij_neon    "")
     endif()
 else()
     add_zmij_variant(zmij_scalar          -march=x86-64)
