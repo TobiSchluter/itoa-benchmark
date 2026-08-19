@@ -11,7 +11,7 @@ option(ITOA_NEON2SSE
     "On x86, also build zmij's NEON path via the neon2sse header (needs network \
 at configure time to fetch it)" OFF)
 
-set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # gnu++ (not strict c++) so that std::numeric_limits and arithmetic on the
 # __int128 extension behave as expected across gcc and clang.
@@ -159,20 +159,20 @@ endif()
 set_target_properties(itoa PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 # ---------------------------------------------------------------------------
-# Exhaustive int32 validation of zmij against jeaiii, timing several
-# validation strategies (see src/validate_i32.cc).
+# Exhaustive int32 and uint32 validation of zmij against jeaiii, timing
+# several validation strategies (see src/validate32.cc).
 # ---------------------------------------------------------------------------
-add_executable(validate_i32
-    "${CMAKE_SOURCE_DIR}/src/validate_i32.cc"
+add_executable(validate32
+    "${CMAKE_SOURCE_DIR}/src/validate32.cc"
     "${CMAKE_SOURCE_DIR}/src/itoa_jeaiii.cpp"
     "${CMAKE_SOURCE_DIR}/src/fmt.cpp")
-target_include_directories(validate_i32 PRIVATE "${CMAKE_SOURCE_DIR}/src")
-target_compile_definitions(validate_i32 PRIVATE NDEBUG)
+target_include_directories(validate32 PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_definitions(validate32 PRIVATE NDEBUG)
 find_package(Threads REQUIRED)
-target_link_libraries(validate_i32 PRIVATE fmt::fmt Threads::Threads)
-target_compile_options(validate_i32 PRIVATE -O3)
+target_link_libraries(validate32 PRIVATE fmt::fmt Threads::Threads)
+target_compile_options(validate32 PRIVATE -O3)
 if(ITOA_NATIVE)
-    target_compile_options(validate_i32 PRIVATE -march=native)
+    target_compile_options(validate32 PRIVATE -march=native)
 else()
-    target_compile_options(validate_i32 PRIVATE -march=${ITOA_ARCH})
+    target_compile_options(validate32 PRIVATE -march=${ITOA_ARCH})
 endif()

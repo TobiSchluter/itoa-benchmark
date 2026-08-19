@@ -223,7 +223,7 @@ boundary).
 
 ## Build and Run
 
-Requirements: CMake ≥ 3.20, a C++14 compiler, and network access on first
+Requirements: CMake ≥ 3.20, a C++17 compiler, and network access on first
 configure (CMake fetches {fmt} via `FetchContent`). Presets are provided for
 `g++-16` (default) and `clang++-21`.
 
