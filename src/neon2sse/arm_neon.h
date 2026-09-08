@@ -1,6 +1,6 @@
 // arm_neon.h stand-in for the neon2sse benchmark variant.
 //
-// zmij.cc includes <arm_neon.h> whenever ZMIJ_USE_NEON is set. Putting this
+// zmij-int.cc includes <arm_neon.h> whenever ZMIJ_USE_NEON is set. Putting this
 // directory on the include path ahead of the toolchain's own headers makes that
 // include resolve here, so the NEON code path can be compiled -- and
 // benchmarked -- on x86 with every intrinsic lowered to SSE by Intel's

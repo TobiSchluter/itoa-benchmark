@@ -64,7 +64,7 @@
 #include <thread>
 #include <vector>
 
-#include "zmij.cc"
+#include "zmij-int.cc"
 
 using u128 = unsigned __int128;
 using i128 = __int128;
@@ -90,22 +90,22 @@ using ref_fn = void (*)(T, char*);
 
 // zmij's entry point for each validated type.
 auto zmij_write(int32_t v, char* out) -> char* {
-  return zmij::detail::itoa_signed(v, out);
+  return zmij::details_int::itoa_signed(out, v);
 }
 auto zmij_write(uint32_t v, char* out) -> char* {
-  return zmij::detail::itoa(v, out);
+  return zmij::details_int::itoa(out, v);
 }
 auto zmij_write(int64_t v, char* out) -> char* {
-  return zmij::detail::itoa_signed(v, out);
+  return zmij::details_int::itoa_signed(out, v);
 }
 auto zmij_write(uint64_t v, char* out) -> char* {
-  return zmij::detail::itoa(v, out);
+  return zmij::details_int::itoa(out, v);
 }
 auto zmij_write(i128 v, char* out) -> char* {
-  return zmij::detail::itoa_signed(v, out);
+  return zmij::details_int::itoa_signed(out, v);
 }
 auto zmij_write(u128 v, char* out) -> char* {
-  return zmij::detail::itoa(v, out);
+  return zmij::details_int::itoa(out, v);
 }
 
 // --ref=self: zmij as its own reference. Kept out of line so it stays a call

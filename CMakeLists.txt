@@ -75,7 +75,7 @@ endif()
 # ---------------------------------------------------------------------------
 # zmij microarchitecture variants.
 #
-# The library (src/zmij.cc) selects code paths from the compiler's ISA macros,
+# The library (src/zmij-int.cc) selects code paths from the compiler's ISA macros,
 # so each tier is a separate object library pinned to an x86-64 microarch level
 # and linked in. OBJECT libraries add their objects directly to `itoa`, so the
 # self-registering (REGISTER_TEST128) TUs are never dropped by the linker.
@@ -140,7 +140,7 @@ else()
         add_zmij_variant(zmij_neon_shim "-march=native;-mtune=native")
         target_include_directories(zmij_neon_shim BEFORE PRIVATE
             "${CMAKE_SOURCE_DIR}/src/neon2sse" "${NEON2SSE_DIR}")
-        # ZMIJ_USE_SSE=0 so zmij.cc takes the NEON branch rather than its own
+        # ZMIJ_USE_SSE=0 so zmij-int.cc takes the NEON branch rather than its own
         # x86 one; the shim still compiles it all down to SSE.
         target_compile_definitions(zmij_neon_shim PRIVATE
             ZMIJ_USE_NEON=1 ZMIJ_USE_SSE=0 ZMIJ_NEON2SSE_SHIM=1)
