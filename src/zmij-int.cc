@@ -507,6 +507,26 @@ struct data {
   uint128 div10k = splat64(div10k_sig);
   uint128 neg10k = splat64(details_int::neg10k);
   uint128 zeros = splat64(details_int::zeros);
+#  if !ZMIJ_USE_SSE4_1
+  // 10^lz for lz = 16 - len in [0, 15]: scaling a len-digit value by it moves
+  // the MSD into the top digit of the 16-digit field.
+  uint64_t scale10[16] = {1,
+                          10,
+                          100,
+                          1000,
+                          10000,
+                          100000,
+                          1000000,
+                          10000000,
+                          100000000,
+                          1000000000,
+                          10000000000,
+                          100000000000,
+                          1000000000000,
+                          10000000000000,
+                          100000000000000,
+                          1000000000000000};
+#  endif  // !ZMIJ_USE_SSE4_1
 #endif    // ZMIJ_USE_SSE
 
   // Reverse-and-left-align shuffle for integer output. Indexing at offset `lz`
@@ -514,8 +534,8 @@ struct data {
   // that reverses an MSB-first BCD vector while dropping `lz` leading zeros in a
   // single pshufb. Indices >= 0x80 emit a zero byte (positions past the last
   // significant digit, which the caller does not write out). Only itoa_body's
-  // SSE4.1 pshufb uses it (SSE2 itoa left-aligns in-register; the padded bodies
-  // use bswap), so it's absent from non-SSE4.1 builds.
+  // SSE4.1 pshufb uses it (SSE2 itoa left-aligns by the scale10 pre-scale;
+  // the padded bodies use bswap), so it's absent from non-SSE4.1 builds.
 #if ZMIJ_USE_SSE4_1
   // The 0x80 run extends to offset 24 so every all-padding window is a valid
   // 16-byte load. Offsets past 16 arise where a store's digits are entirely
@@ -1184,24 +1204,32 @@ ZMIJ_INLINE void itoa_body32_pad(char* dst, uint64_t mid, uint64_t low,
   itoa_body16_pad(dst + 16, low, d);
 }
 
-// Left-aligns a 16-wide field (leading-zero padded) by dropping lz leading
-// zeroes. The significant tail occupies the low 16 - lz bytes, so the
-// left-align is a right shift of the whole 128-bit value by lz bytes.
-ZMIJ_INLINE auto drop_leading_zeroes(__m128i x, int lz) noexcept -> uint128_t {
-  // Extract the two halves (x is already ASCII-biased by to_ascii16) and
-  // left-align by right-shifting the full 128-bit value by lz bytes in GPRs.
-  // lz is in [0, 15] so the shift stays < 128 bits.
-  uint64_t lo = uint64_t(_mm_cvtsi128_si64(x));
-  uint64_t hi = uint64_t(_mm_cvtsi128_si64(_mm_unpackhi_epi64(x, x)));
-  uint128_t full = (uint128_t(hi) << 64) | lo;
-  return full >> (lz * 8);  // lz bytes -> bits
-}
-
+// Convert value in [0, 1e16) to ASCII digits, write left-aligned at out.
+// Returns the past-the-end pointer, out + len. `len` is the digit count of
+// `value`, which the caller supplies.
 ZMIJ_INLINE char* itoa_body(char* out, uint64_t value, uint64_t len,
                             const data& d) noexcept {
-  int leading_zeroes = int(16 - len);
-  uint128_t r = drop_leading_zeroes(to_ascii16(value, d), leading_zeroes);
-  copy_bytes(out, &r, 16);
+  // Scale by 10^(16 - len) so the MSD lands in the top digit of the field:
+  // the kernel's output is left-aligned in the register and the XMM stores
+  // directly -- no GPR extraction and no 128-bit shift. The kernel now waits
+  // on the digit count and the scale multiply, but the returned length does
+  // not.
+  uint64_t scaled = value * d.scale10[16 - len];
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), to_ascii16(scaled, d));
+  return out + len;
+}
+
+// Left-aligned head for a value < 1e8 (the 33-39-digit u128 top group): one
+// 8-digit BCD group, right-aligned in a u64, shifted down by the leading
+// zeros and stored as 8 bytes -- the following padded chunks overwrite the
+// bytes past len. Cheaper than the 16-digit kernel, whose scaled form would
+// wait on the digit count at the end of the two-divmod u128 chain. Mirrors
+// the scalar u32 path's high-group store.
+ZMIJ_INLINE char* itoa_head7(char* out, uint32_t top, uint64_t len) noexcept {
+  uint64_t bcd = to_bcd8(top).bcd + zeros;
+  uint64_t sh = 8 * (8 - len);
+  uint64_t aligned = is_big_endian ? bcd << sh : bcd >> sh;
+  copy_bytes(out, &aligned, 8);
   return out + len;
 }
 
@@ -1468,6 +1496,8 @@ auto itoa_u128_wide(char* out, uint128_t value) noexcept -> char* {
   divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot, *d);
 #if ZMIJ_USE_AVX2
   char* p = itoa_top8(out, hi.quot, count_digits(hi.quot, *d), *d);
+#elif ZMIJ_USE_SSE && !ZMIJ_USE_SSE4_1
+  char* p = itoa_head7(out, hi.quot, count_digits(hi.quot, *d));
 #else
   char* p = itoa_body(out, hi.quot, count_digits(hi.quot, *d), *d);
 #endif
