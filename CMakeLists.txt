@@ -111,7 +111,22 @@ else()
     add_zmij_variant(zmij_x64_v1          -march=x86-64)
     add_zmij_variant(zmij_x64_v2          -march=x86-64-v2)
     add_zmij_variant(zmij_x64_v3          -march=x86-64-v3)
-    add_zmij_variant(zmij_x64_v4          -march=x86-64-v4)
+    # The v4 tier is linked only where the build host can execute AVX-512:
+    # the tier's global constant tables get a dynamic initializer that the
+    # compiler vectorizes at the tier's own -march, so on a host without
+    # AVX-512 the binary dies with SIGILL before main, whatever --filter says.
+    include(CheckCXXSourceRuns)
+    set(CMAKE_REQUIRED_FLAGS "-march=x86-64-v4")
+    check_cxx_source_runs("#include <immintrin.h>
+      int main() { __m512i x = _mm512_set1_epi32(1);
+                   return _mm512_reduce_add_epi32(x) - 16; }"
+      ITOA_HOST_HAS_AVX512)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(ITOA_HOST_HAS_AVX512)
+        add_zmij_variant(zmij_x64_v4      -march=x86-64-v4)
+    else()
+        message(STATUS "Host cannot execute AVX-512; skipping the zmij v4 tier")
+    endif()
     add_zmij_variant(zmij_x64_native "-march=native;-mtune=native")
 
     # zmij's NEON path, lowered to SSE by Intel's neon2sse header so it can be
