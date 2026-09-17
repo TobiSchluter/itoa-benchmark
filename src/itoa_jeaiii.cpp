@@ -251,8 +251,8 @@ namespace jeaiii
     }
 }
 
-void u32toa_jeaiii(uint32_t i, char* b) { jeaiii::to_text_from_integer(b, i); }
-void i32toa_jeaiii(int32_t i, char* b)  { jeaiii::to_text_from_integer(b, i); }
-void u64toa_jeaiii(uint64_t i, char* b) { jeaiii::to_text_from_integer(b, i); }
-void i64toa_jeaiii(int64_t i, char* b)  { jeaiii::to_text_from_integer(b, i); }
+void u32toa_jeaiii(uint32_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void i32toa_jeaiii( int32_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void u64toa_jeaiii(uint64_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void i64toa_jeaiii( int64_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
 #endif // JEAIII_TO_TEXT_H_
