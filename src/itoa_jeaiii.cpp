@@ -1,8 +1,7 @@
 /*
 MIT License
 
-Copyright (c) 2017 James Edward Anhalt III (jeaiii)
-https://github.com/jeaiii/itoa
+Copyright (c) 2022 James Edward Anhalt III - https://github.com/jeaiii/itoa
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -23,107 +22,237 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-#include <stdint.h>
+#ifndef JEAIII_TO_TEXT_H_
+#define JEAIII_TO_TEXT_H_
 
-#define A(N) t = (1ULL << (32 + N / 5 * N * 53 / 16)) / uint32_t(1e##N) + 1 - N / 9, t *= u, t >>= N / 5 * N * 53 / 16, t += N / 5 * 4
+#include <inttypes.h>
 
-#if 0
-// 1 char at a time
+namespace jeaiii
+{
+    using u32 = decltype(0xffffffff);
+    using u64 = decltype(0xffffffffffffffff);
 
-#define D(N) b[N] = char(t >> 32) + '0'
-#define E t = 10ULL * uint32_t(t)
+    struct pair
+    {
+        char dd[2];
+        constexpr pair(char c) : dd{ c, '\0' } { }
+        constexpr pair(int n) : dd{ "0123456789"[n / 10], "0123456789"[n % 10] } { }
+    };
 
-#define L0 b[0] = char(u) + '0'
-#define L1 A(1), D(0), E, D(1)
-#define L2 A(2), D(0), E, D(1), E, D(2)
-#define L3 A(3), D(0), E, D(1), E, D(2), E, D(3)
-#define L4 A(4), D(0), E, D(1), E, D(2), E, D(3), E, D(4)
-#define L5 A(5), D(0), E, D(1), E, D(2), E, D(3), E, D(4), E, D(5)
-#define L6 A(6), D(0), E, D(1), E, D(2), E, D(3), E, D(4), E, D(5), E, D(6)
-#define L7 A(7), D(0), E, D(1), E, D(2), E, D(3), E, D(4), E, D(5), E, D(6), E, D(7)
-#define L8 A(8), D(0), E, D(1), E, D(2), E, D(3), E, D(4), E, D(5), E, D(6), E, D(7), E, D(8)
-#define L9 A(9), D(0), E, D(1), E, D(2), E, D(3), E, D(4), E, D(5), E, D(6), E, D(7), E, D(8), E, D(9)
+    constexpr struct
+    {
+        pair dd[100]
+        {
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+            10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+            30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+            40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+            50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+            60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+            70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+            80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+        };
+        pair fd[100]
+        {
+            '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+            10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+            20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
+            30, 31, 32, 33, 34, 35, 36, 37, 38, 39,
+            40, 41, 42, 43, 44, 45, 46, 47, 48, 49,
+            50, 51, 52, 53, 54, 55, 56, 57, 58, 59,
+            60, 61, 62, 63, 64, 65, 66, 67, 68, 69,
+            70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+            80, 81, 82, 83, 84, 85, 86, 87, 88, 89,
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99,
+        };
+    }
+    digits;
 
+    constexpr u64 mask24 = (u64(1) << 24) - 1;
+    constexpr u64 mask32 = (u64(1) << 32) - 1;
+    constexpr u64 mask57 = (u64(1) << 57) - 1;
+
+    template<bool, class, class F> struct _cond { using type = F; };
+    template<class T, class F> struct _cond<true, T, F> { using type = T; };
+    template<bool B, class T, class F> using cond = typename _cond<B, T, F>::type;
+
+    template<class T>
+#if defined(_MSC_VER)
+    __forceinline
 #else
-// 2 chars at a time, little endian only, unaligned 2 byte writes
-
-static const uint16_t s_100s[] = {
-    '00', '10', '20', '30', '40', '50', '60', '70', '80', '90',
-    '01', '11', '21', '31', '41', '51', '61', '71', '81', '91',
-    '02', '12', '22', '32', '42', '52', '62', '72', '82', '92',
-    '03', '13', '23', '33', '43', '53', '63', '73', '83', '93',
-    '04', '14', '24', '34', '44', '54', '64', '74', '84', '94',
-    '05', '15', '25', '35', '45', '55', '65', '75', '85', '95',
-    '06', '16', '26', '36', '46', '56', '66', '76', '86', '96',
-    '07', '17', '27', '37', '47', '57', '67', '77', '87', '97',
-    '08', '18', '28', '38', '48', '58', '68', '78', '88', '98',
-    '09', '19', '29', '39', '49', '59', '69', '79', '89', '99',
-};
-
-#define W(N, I) *(uint16_t*)&b[N] = s_100s[I]
-#define Q(N) b[N] = char((10ULL * uint32_t(t)) >> 32) + '0'
-#define D(N) W(N, t >> 32)
-#define E t = 100ULL * uint32_t(t)
-
-#define L0 b[0] = char(u) + '0'
-#define L1 W(0, u)
-#define L2 A(1), D(0), Q(2)
-#define L3 A(2), D(0), E, D(2)
-#define L4 A(3), D(0), E, D(2), Q(4)
-#define L5 A(4), D(0), E, D(2), E, D(4)
-#define L6 A(5), D(0), E, D(2), E, D(4), Q(6)
-#define L7 A(6), D(0), E, D(2), E, D(4), E, D(6) 
-#define L8 A(7), D(0), E, D(2), E, D(4), E, D(6), Q(8)
-#define L9 A(8), D(0), E, D(2), E, D(4), E, D(6), E, D(8)
-
+    inline
 #endif
-
-#define LN(N) (L##N, b += N + 1)
-#define LZ(N) (L##N, b[N + 1] = '\0')
-#define LG(F) (u<100 ? u<10 ? F(0) : F(1) : u<1000000 ? u<10000 ? u<1000 ? F(2) : F(3) : u<100000 ? F(4) : F(5) : u<100000000 ? u<10000000 ? F(6) : F(7) : u<1000000000 ? F(8) : F(9))
-
-void u32toa_jeaiii(uint32_t u, char* b)
-{
-    uint64_t t;
-    LG(LZ);
-}
-
-void i32toa_jeaiii(int32_t i, char* b)
-{
-    uint32_t u = i < 0 ? *b++ = '-', 0 - uint32_t(i) : i;
-    uint64_t t;
-    LG(LZ);
-}
-
-void u64toa_jeaiii(uint64_t n, char* b)
-{
-    uint32_t u;
-    uint64_t t;
-
-    if (uint32_t(n >> 32) == 0)
-        return u = uint32_t(n), (void)LG(LZ);
-
-    uint64_t a = n / 100000000;
-
-    if (uint32_t(a >> 32) == 0)
+    char* to_text_from_integer(char* b, T i)
     {
-        u = uint32_t(a);
-        LG(LN);
-    }
-    else
-    {
-        u = uint32_t(a / 100000000);
-        LG(LN);
-        u = a % 100000000;
-        LN(7);
-    }
+        constexpr auto q = sizeof(T);
+        using U = cond<q == 1, unsigned char, cond<q <= sizeof(short), unsigned short, cond<q <= sizeof(u32), u32, u64>>>;
 
-    u = n % 100000000;
-    LZ(7);
+        // convert bool to int before test with unary + to silence warning if T happens to be bool
+        U const n = +i < 0 ? *b++ = '-', U(0) - U(i) : U(i);
+
+        if (n < u32(1e2))
+        {
+            *reinterpret_cast<pair*>(b) = digits.fd[n];
+            return n < 10 ? b + 1 : b + 2;
+        }
+        if (n < u32(1e6))
+        {
+            if (n < u32(1e4))
+            {
+                auto f0 = u32(10 * (1 << 24) / 1e3 + 1) * n;
+                *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 24];
+                b -= n < u32(1e3);
+                auto f2 = (f0 & mask24) * 100;
+                *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 24];
+                return b + 4;
+            }
+            auto f0 = u64(10 * (1ull << 32ull)/ 1e5 + 1) * n;
+            *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 32];
+            b -= n < u32(1e5);
+            auto f2 = (f0 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+            auto f4 = (f2 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+            return b + 6;
+        }
+        if (n < u64(1ull << 32ull))
+        {
+            if (n < u32(1e8))
+            {
+                auto f0 = u64(10 * (1ull << 48ull) / 1e7 + 1) * n >> 16;
+                *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 32];
+                b -= n < u32(1e7);
+                auto f2 = (f0 & mask32) * 100;
+                *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+                auto f4 = (f2 & mask32) * 100;
+                *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+                auto f6 = (f4 & mask32) * 100;
+                *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 32];
+                return b + 8;
+            }
+            auto f0 = u64(10 * (1ull << 57ull) / 1e9 + 1) * n;
+            *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 57];
+            b -= n < u32(1e9);
+            auto f2 = (f0 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 57];
+            auto f4 = (f2 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 57];
+            auto f6 = (f4 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 57];
+            auto f8 = (f6 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 8) = digits.dd[f8 >> 57];
+            return b + 10;
+        }
+
+        // if we get here U must be u64 but some compilers don't know that, so reassign n to a u64 to avoid warnings
+        u32 z = n % u32(1e8);
+        u64 u = n / u32(1e8);
+
+        if (u < u32(1e2))
+        {
+            // u can't be 1 digit (if u < 10 it would have been handled above as a 9 digit 32bit number)
+            *reinterpret_cast<pair*>(b) = digits.dd[u];
+            b += 2;
+        }
+        else if (u < u32(1e6))
+        {
+            if (u < u32(1e4))
+            {
+                auto f0 = u32(10 * (1 << 24) / 1e3 + 1) * u;
+                *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 24];
+                b -= u < u32(1e3);
+                auto f2 = (f0 & mask24) * 100;
+                *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 24];
+                b += 4;
+            }
+            else
+            {
+                auto f0 = u64(10 * (1ull << 32ull) / 1e5 + 1) * u;
+                *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 32];
+                b -= u < u32(1e5);
+                auto f2 = (f0 & mask32) * 100;
+                *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+                auto f4 = (f2 & mask32) * 100;
+                *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+                b += 6;
+            }
+        }
+        else if (u < u32(1e8))
+        {
+            auto f0 = u64(10 * (1ull << 48ull) / 1e7 + 1) * u >> 16;
+            *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 32];
+            b -= u < u32(1e7);
+            auto f2 = (f0 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+            auto f4 = (f2 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+            auto f6 = (f4 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 32];
+            b += 8;
+        }
+        else if (u < u64(1ull << 32ull))
+        {
+            auto f0 = u64(10 * (1ull << 57ull) / 1e9 + 1) * u;
+            *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 57];
+            b -= u < u32(1e9);
+            auto f2 = (f0 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 57];
+            auto f4 = (f2 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 57];
+            auto f6 = (f4 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 57];
+            auto f8 = (f6 & mask57) * 100;
+            *reinterpret_cast<pair*>(b + 8) = digits.dd[f8 >> 57];
+            b += 10;
+        }
+        else
+        {
+            u32 y = u % u32(1e8);
+            u /= u32(1e8);
+
+            // u is 2, 3, or 4 digits (if u < 10 it would have been handled above)
+            if (u < u32(1e2))
+            {
+                *reinterpret_cast<pair*>(b) = digits.dd[u];
+                b += 2;
+            }
+            else
+            {
+                auto f0 = u32(10 * (1 << 24) / 1e3 + 1) * u;
+                *reinterpret_cast<pair*>(b) = digits.fd[f0 >> 24];
+                b -= u < u32(1e3);
+                auto f2 = (f0 & mask24) * 100;
+                *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 24];
+                b += 4;
+            }
+            // do 8 digits
+            auto f0 = (u64((1ull << 48ull) / 1e6 + 1) * y >> 16) + 1;
+            *reinterpret_cast<pair*>(b) = digits.dd[f0 >> 32];
+            auto f2 = (f0 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+            auto f4 = (f2 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+            auto f6 = (f4 & mask32) * 100;
+            *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 32];
+            b += 8;
+        }
+        // do 8 digits
+        auto f0 = (u64((1ull << 48ull) / 1e6 + 1) * z >> 16) + 1;
+        *reinterpret_cast<pair*>(b) = digits.dd[f0 >> 32];
+        auto f2 = (f0 & mask32) * 100;
+        *reinterpret_cast<pair*>(b + 2) = digits.dd[f2 >> 32];
+        auto f4 = (f2 & mask32) * 100;
+        *reinterpret_cast<pair*>(b + 4) = digits.dd[f4 >> 32];
+        auto f6 = (f4 & mask32) * 100;
+        *reinterpret_cast<pair*>(b + 6) = digits.dd[f6 >> 32];
+        return b + 8;
+    }
 }
 
-void i64toa_jeaiii(int64_t i, char* b)
-{
-    uint64_t n = i < 0 ? *b++ = '-', 0 - uint64_t(i) : i;
-    u64toa_jeaiii(n, b);
-}
+void u32toa_jeaiii(uint32_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void i32toa_jeaiii( int32_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void u64toa_jeaiii(uint64_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+void i64toa_jeaiii( int64_t i, char* b) { *jeaiii::to_text_from_integer(b, i) = '\0'; }
+#endif // JEAIII_TO_TEXT_H_
