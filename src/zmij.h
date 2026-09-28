@@ -86,8 +86,8 @@ enum {
 enum {
   uint32_buffer_size = 16,
   int32_buffer_size = 17,
-  uint64_buffer_size = 20,
-  int64_buffer_size = 21,
+  uint64_buffer_size = 32,
+  int64_buffer_size = 33,
   uint128_buffer_size = 48,
   int128_buffer_size = 49,
 };

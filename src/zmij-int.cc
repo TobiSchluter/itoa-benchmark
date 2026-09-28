@@ -550,6 +550,52 @@ struct u64_chain_tables {
 };
 #endif
 
+// u64 digits from two 4-digit-group chains running side by side in the two
+// 64-bit lanes of one XMM register: pmuludq by 10^4 keeps each lane's
+// fraction in place and leaves the group in the high dword, one shuffle
+// gathers the four groups for to_ascii_4x4, and one window shuffle chosen by
+// the digit count lays the 16 low digits out; the top four come from a GPR.
+// Experiment.
+#ifndef ZMIJ_USE_U64_LANE_CHAIN
+#  define ZMIJ_USE_U64_LANE_CHAIN 0
+#endif
+
+#if ZMIJ_USE_U64_LANE_CHAIN
+struct u64_lane_tables {
+  uint128 k1e4 = {10000, 10000};  // 10^4 in each qword lane's low dword
+  // ceil(2^90 / 1e8), a memory operand for both splits: x * it has x / 1e8
+  // above bit 90 and (x mod 1e8) / 1e8 below, exact to x * 0.0076 / 2^90.
+  uint64_t mul90 = 12379400392853802749ull;
+  // ASCII digit pairs, print order (tens in the low byte), for the head.
+  uint16_t pairs[100] = {};
+  // Window shuffles by digit count. to_ascii_4x4 leaves the vector as
+  // [G2 G4 G3 G5] with each group's digits reversed within its dword; entry
+  // c lays digits 5..20 out in print order dropping the first 16 - c bytes
+  // (none for c >= 16), zeros after.
+  uint8_t window[21][16] = {};
+  // By digit count: the head word's right shift, 8 * (4 - head digits),
+  // and the body's offset, the head digits max(c - 16, 0).
+  uint8_t head_shift[21] = {};
+  uint8_t body_off[21] = {};
+  constexpr u64_lane_tables() {
+    for (int i = 0; i < 100; ++i)
+      pairs[i] = uint16_t(('0' + i / 10) | ('0' + i % 10) << 8);
+    for (int c = 0; c <= 20; ++c) {
+      int hs = c > 16 ? c - 16 : 0;
+      head_shift[c] = uint8_t(32 - 8 * hs);
+      body_off[c] = uint8_t(hs);
+    }
+    constexpr uint8_t print_order[16] = {3, 2, 1, 0,  11, 10, 9,  8,
+                                         7, 6, 5, 4,  15, 14, 13, 12};
+    for (int c = 0; c <= 20; ++c) {
+      int w = c < 16 ? 16 - c : 0;
+      for (int j = 0; j < 16; ++j)
+        window[c][j] = j + w < 16 ? print_order[j + w] : uint8_t(0x80);
+    }
+  }
+};
+#endif
+
 // u32 digits from one jeaiii-style multiply chain in a GPR, branch-free: the
 // multiplier is selected by the digit count instead of the digit count
 // selecting a code path (see itoa). Experiment.
@@ -850,6 +896,9 @@ struct data {
 #endif
 #if ZMIJ_USE_U32_CHAIN
   u32_chain_tables u32_chain;
+#endif
+#if ZMIJ_USE_U64_LANE_CHAIN
+  u64_lane_tables u64_lane;
 #endif
 };
 alignas(64) constexpr data static_data;
@@ -1636,7 +1685,51 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       return out + len;
 #endif
     } else {
-#if ZMIJ_USE_U64_CHAIN && ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128
+#if ZMIJ_USE_U64_LANE_CHAIN && ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128
+      // Five 4-digit groups G1..G5 on the 20-digit grid. Two products by
+      // ceil(2^90 / 1e8): v's gives q = v / 1e8 above bit 90 and G4 G5 as
+      // the fraction below; q's gives G1 above bit 90 and G2 G3 below. The
+      // top 32 fraction bits, rounded up, feed one lane each: eight digits
+      // from a 32-bit fraction allow 42.9 units of 2^-32 of error and get
+      // under 2. Two pmuludq by 10^4 then expose a group per lane per step
+      // in the high dword, the low dword being the next fraction already in
+      // place. The count is consumed only at the end, by the window shuffle
+      // and the store offset, so the first product starts from v at once.
+      uint64_t c = count_digits(v, *d);
+      uint128_t p1 = uint128_t(v) * d->u64_lane.mul90;
+      uint64_t q = uint64_t(p1 >> 90);  // v / 1e8, < 1.85e11
+      uint32_t f_b = uint32_t(p1 >> 58) + 1;  // digits 13..20
+      uint128_t p2 = uint128_t(q) * d->u64_lane.mul90;
+      uint64_t g1 = uint64_t(p2 >> 90);  // digits 1..4, <= 1844
+      uint32_t f_a = uint32_t(p2 >> 58) + 1;  // digits 5..12
+
+      const __m128i k1e4 = _mm_load_si128(m128ptr(&d->u64_lane.k1e4));
+      __m128i x = _mm_set_epi64x(int64_t(f_b), int64_t(f_a));  // lane 0 a
+      __m128i s1 = _mm_mul_epu32(x, k1e4);   // G2 | G4 in the high dwords
+      __m128i s2 = _mm_mul_epu32(s1, k1e4);  // G3 | G5
+      __m128i g = _mm_castps_si128(_mm_shuffle_ps(
+          _mm_castsi128_ps(s1), _mm_castsi128_ps(s2), _MM_SHUFFLE(3, 1, 3, 1)));
+      __m128i ascii = to_ascii_4x4(g, *d);  // [G2 G4 G3 G5], reversed within
+      // G1's two pairs form the head word, left-aligned by a shift and
+      // stored first; the window shuffle puts digits 5..20 in print order,
+      // left-aligned for c <= 16, stored over the head's unused bytes at
+      // out + (c - 16 or 0). The shift and the offset come from byte tables
+      // by count: computing them cost gcc a sign-mask ladder and two spills.
+      // One product gives both pairs: the quotient g1 / 100 in the high
+      // word, the remainder's digits from the top 7 bits of the fraction
+      // (see frac100); the lookups no longer wait on each other.
+      uint64_t t1 = g1 * frac_tail_mul;
+      uint16_t g1_lo;
+      copy_bytes(&g1_lo, d->frac100.e[uint32_t(t1) >> 25], 2);
+      uint64_t head = d->u64_lane.pairs[t1 >> 32] | uint64_t(g1_lo) << 16;
+      head >>= d->u64_lane.head_shift[c];
+      __m128i window = _mm_loadu_si128(m128ptr(d->u64_lane.window[c]));
+      copy_bytes(out, &head, 4);
+      _mm_storeu_si128(
+          reinterpret_cast<__m128i*>(out + d->u64_lane.body_off[c]),
+          _mm_shuffle_epi8(ascii, window));
+      return out + c;
+#elif ZMIJ_USE_U64_CHAIN && ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128
       // Two 10-digit blocks from one 64x64->128 multiply by ceil(2^97 / 1e10):
       // the high word holds hi = v / 1e10 above bit 33 and the low block as
       // a fraction below it; extended with the low word and rounded up, the
