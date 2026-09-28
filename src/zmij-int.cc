@@ -550,6 +550,110 @@ struct u64_chain_tables {
 };
 #endif
 
+// u32 digits from one jeaiii-style multiply chain in a GPR, branch-free: the
+// multiplier is selected by the digit count instead of the digit count
+// selecting a code path (see itoa). Experiment.
+#ifndef ZMIJ_USE_U32_CHAIN
+#  define ZMIJ_USE_U32_CHAIN 0
+#endif
+// Digits per chain step: 2 (five pairs above a 57-bit fraction) or 3 (three
+// triples and a digit above a 54-bit fraction).
+#ifndef ZMIJ_U32_CHAIN_DIGITS
+#  define ZMIJ_U32_CHAIN_DIGITS 2
+#endif
+// 1: with triples, the leading digit comes first, alone, from a 128-bit
+// product (ceil(2^63 * 10^(1-c)) as the scale; one digit above a 64-bit
+// product would leave the c = 10 error over the 1e-9 window), then three
+// triples: 1 + 3 + 3 + 3 instead of 3 + 3 + 3 + 1.
+#ifndef ZMIJ_U32_CHAIN_DIGIT_FIRST
+#  define ZMIJ_U32_CHAIN_DIGIT_FIRST 0
+#endif
+// 1: the chain runs on a 32-bit fraction: the first product is taken at the
+// full width (57 or 54 bits) and shifted down to put its group above bit
+// 32, and every step from there is u32(t) * 10^k -- a zero-extension
+// instead of a mask, no mask register. The steps add no error, so only the
+// first product's matters: the 8 digits after the first pair allow 42.9
+// units of 2^-32, the 7 after the first triple 429, and the table's
+// multipliers are biased upward so the shift's truncation never pushes the
+// error below zero (see the table).
+#ifndef ZMIJ_U32_CHAIN_FRAC32
+#  define ZMIJ_U32_CHAIN_FRAC32 0
+#endif
+
+#if ZMIJ_USE_U32_CHAIN
+struct u32_chain_tables {
+  // Per digit count c in 1..10 the left-alignment factor 10^(10-c) folded
+  // into jeaiii's fixed-point conversion: ceil(2^57 * 10^(2-c)) for pairs,
+  // ceil(2^54 * 10^(3-c)) for triples. v * scale[c] puts the leading group
+  // of v's ten left-aligned digits above the fraction. The multiplier's
+  // rounding error times v must stay under 2^57 * 1e-8 (2^54 * 1e-7): for
+  // c <= 9 it does with v < 1e9 and any error below 1; for c = 10 the
+  // errors are 0.2415 (0.052), times 2^32 still under. Row 0 duplicates
+  // row 1 (count_digits(0) is 1 anyway).
+  static constexpr int digits = ZMIJ_U32_CHAIN_DIGITS;
+  static constexpr bool digit_first = ZMIJ_U32_CHAIN_DIGIT_FIRST != 0;
+  static constexpr int frac_bits = digits == 2 ? 57 : 54;
+  // Digit-first: the leading digit is above bit 63 of the 128-bit product,
+  // so the scale is ceil(2^63 * 10^(1-c)); the error v * delta / 2^63 stays
+  // under 2^-31, well inside the nine remaining digits' 1e-9.
+  static constexpr int first_digits = digit_first ? 1 : digits;
+  static constexpr int scale_bits = digit_first ? 63 : frac_bits;
+  uint64_t scale[11] = {};
+  // ASCII digit pairs, print order (tens in the low byte). Inside data so
+  // the lookups address off the data pointer like the scale. Two entries of
+  // padding: each pair is copied out as four bytes, the next entry along
+  // with it, which the following store overwrites.
+  uint16_t pairs[102] = {};
+  // ASCII digit triples, print order, a zero pad byte on top. Copied out as
+  // four bytes, the pad under the next copy.
+  uint32_t triples[digits == 3 ? 1000 : 1] = {};
+  constexpr u32_chain_tables() {
+    for (int i = 0; i < 100; ++i)
+      pairs[i] = uint16_t(('0' + i / 10) | ('0' + i % 10) << 8);
+    if (digits == 3) {
+      for (int i = 0; i < 1000; ++i)
+        triples[i] = uint32_t(('0' + i / 100) | ('0' + i / 10 % 10) << 8 |
+                              ('0' + i % 10) << 16);
+    }
+    uint64_t one = uint64_t(1) << scale_bits;
+    for (int c = 1; c <= first_digits; ++c) {
+      scale[c] = one;
+      for (int k = c; k < first_digits; ++k) scale[c] *= 10;
+    }
+    uint64_t p = 1;
+    for (int c = first_digits + 1; c <= 10; ++c) {
+      p *= 10;
+      scale[c] = one / p + 1;  // 2^k has no factor 5: ceil
+    }
+#if ZMIJ_U32_CHAIN_FRAC32
+    // t = (v * scale[c]) >> (frac_bits - 32) must not fall below the exact
+    // v * 10^(digits-c) * 2^32: the product's excess over the exact value,
+    // v * (scale[c] - exact), must reach 2^(frac_bits - 32) for the
+    // smallest v of the count, 10^(c-1). The ceil above contributes
+    // 10^(c-1) * (1 - r / q) with q = 10^(c-digits) and r = 2^frac_bits
+    // mod q, that is 10^(digits-1) * (q - r) exactly; whatever is missing
+    // is added as whole multiplier units, at most 10 + 10^c / 2^shift of
+    // error. The largest errors are 31 units of 2^-32 (pairs, c = 10) and
+    // 124 (triples, c = 9), against 42.9 and 429 allowed.
+    p = 1;  // 10^(c-1)
+    for (int c = 1; c <= 10; ++c, p *= 10) {
+      uint64_t have = 0;  // 10^(c-1) * (scale[c] - exact), 2^-frac units
+      if (c > digits) {
+        uint64_t q = 1;
+        for (int k = digits; k < c; ++k) q *= 10;  // 10^(c-digits)
+        uint64_t r = one % q;
+        have = q - r;
+        for (int k = 1; k < digits; ++k) have *= 10;
+      }
+      uint64_t need = uint64_t(1) << (frac_bits - 32);
+      if (have < need) scale[c] += (need - have + p - 1) / p;
+    }
+#endif
+    scale[0] = scale[1];
+  }
+};
+#endif
+
 struct data {
   static constexpr auto splat64(uint64_t x) -> uint128 { return {x, x}; }
   static constexpr auto splat32(uint32_t x) -> uint128 {
@@ -743,6 +847,9 @@ struct data {
   uint32_t frac_mul = frac_tail_mul;  // loaded, not materialized, on NEON
 #if ZMIJ_USE_U64_CHAIN
   u64_chain_tables u64_chain;
+#endif
+#if ZMIJ_USE_U32_CHAIN
+  u32_chain_tables u32_chain;
 #endif
 };
 alignas(64) constexpr data static_data;
@@ -1427,7 +1534,90 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
     const auto* d = &static_data;
     ZMIJ_ASM(("" : "+r"(d)));  // Load constants from memory.
     if (sizeof(UInt) <= 4) {
-#if ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
+#if ZMIJ_USE_U32_CHAIN
+      // One multiply by the count-selected scale left-aligns v to ten digits
+      // and puts its leading group above the fraction; each further step
+      // re-scales the fraction to expose the next group. The group stores
+      // cover ten bytes, the digits past c are '0's the caller never sees.
+      // No branch anywhere: the count is a table lookup, the scale another.
+      // The mask lives in a register: clang with BMI2 otherwise turns the
+      // four masks into bzhi behind a byte-register move of the bit count,
+      // which measured 2x on Raptor Lake (3.5 ns vs 2.1 without BMI2). The
+      // pair table is indexed through d at each use: an alias pointer costs
+      // clang a register where the offset folds into the addressing. Each
+      // copy takes four bytes -- the pair and the entry after it -- and the
+      // next copy lands on the two surplus bytes; the last two of the fifth
+      // are past the tenth digit, inside the 16-byte buffer.
+#  if !ZMIJ_U32_CHAIN_FRAC32
+      uint64_t mask = (uint64_t(1) << u32_chain_tables::frac_bits) - 1;
+      ZMIJ_ASM(("" : "+r"(mask)));
+#  endif
+      uint64_t c = count_digits(uint32_t(value), *d);
+#  if ZMIJ_U32_CHAIN_DIGIT_FIRST
+      uint128_t p = umul128(v, d->u32_chain.scale[c]);
+      uint64_t lo = uint64_t(p);
+      // 54-bit fraction, no digit above it. The shift truncates downward by
+      // up to 2^-54, more than the multiplier's upward error can be, so the
+      // + 1 keeps the fraction above the true value (by under 1e-9 still).
+      uint64_t f = ((lo >> 9) & mask) + 1;
+      out[0] = char('0' + (uint64_t(p >> 64) << 1 | lo >> 63));
+      f *= 1000;
+      copy_bytes(out + 1, &d->u32_chain.triples[f >> 54], 4);
+      f = (f & mask) * 1000;
+      copy_bytes(out + 4, &d->u32_chain.triples[f >> 54], 4);
+      f = (f & mask) * 1000;
+      copy_bytes(out + 7, &d->u32_chain.triples[f >> 54], 4);
+      return out + c;
+#  else
+      uint64_t f = v * d->u32_chain.scale[c];
+      // 4-byte copies measured level with 2-byte ones on Raptor Lake, and
+      // +8..+13% on the M5 at odd fixed lengths only; 2 restores the
+      // exact-width copies.
+#  ifndef ZMIJ_U32_CHAIN_COPY
+#    define ZMIJ_U32_CHAIN_COPY 4
+#  endif
+#  if ZMIJ_U32_CHAIN_FRAC32 && ZMIJ_U32_CHAIN_DIGITS == 2
+      uint64_t t = f >> 25;  // pair above bit 32, 32-bit fraction below
+      copy_bytes(out, &d->u32_chain.pairs[t >> 32], ZMIJ_U32_CHAIN_COPY);
+      t = uint32_t(t) * uint64_t(100);
+      copy_bytes(out + 2, &d->u32_chain.pairs[t >> 32], ZMIJ_U32_CHAIN_COPY);
+      t = uint32_t(t) * uint64_t(100);
+      copy_bytes(out + 4, &d->u32_chain.pairs[t >> 32], ZMIJ_U32_CHAIN_COPY);
+      t = uint32_t(t) * uint64_t(100);
+      copy_bytes(out + 6, &d->u32_chain.pairs[t >> 32], ZMIJ_U32_CHAIN_COPY);
+      t = uint32_t(t) * uint64_t(100);
+      copy_bytes(out + 8, &d->u32_chain.pairs[t >> 32], ZMIJ_U32_CHAIN_COPY);
+#  elif ZMIJ_U32_CHAIN_FRAC32
+      uint64_t t = f >> 22;  // triple above bit 32, 32-bit fraction below
+      copy_bytes(out, &d->u32_chain.triples[t >> 32], 4);
+      t = uint32_t(t) * uint64_t(1000);
+      copy_bytes(out + 3, &d->u32_chain.triples[t >> 32], 4);
+      t = uint32_t(t) * uint64_t(1000);
+      copy_bytes(out + 6, &d->u32_chain.triples[t >> 32], 4);
+      t = uint32_t(t) * uint64_t(10);
+      out[9] = char('0' + (t >> 32));
+#  elif ZMIJ_U32_CHAIN_DIGITS == 3
+      copy_bytes(out, &d->u32_chain.triples[f >> 54], 4);
+      f = (f & mask) * 1000;
+      copy_bytes(out + 3, &d->u32_chain.triples[f >> 54], 4);
+      f = (f & mask) * 1000;
+      copy_bytes(out + 6, &d->u32_chain.triples[f >> 54], 4);
+      f = (f & mask) * 10;
+      out[9] = char('0' + (f >> 54));
+#  else
+      copy_bytes(out, &d->u32_chain.pairs[f >> 57], ZMIJ_U32_CHAIN_COPY);
+      f = (f & mask) * 100;
+      copy_bytes(out + 2, &d->u32_chain.pairs[f >> 57], ZMIJ_U32_CHAIN_COPY);
+      f = (f & mask) * 100;
+      copy_bytes(out + 4, &d->u32_chain.pairs[f >> 57], ZMIJ_U32_CHAIN_COPY);
+      f = (f & mask) * 100;
+      copy_bytes(out + 6, &d->u32_chain.pairs[f >> 57], ZMIJ_U32_CHAIN_COPY);
+      f = (f & mask) * 100;
+      copy_bytes(out + 8, &d->u32_chain.pairs[f >> 57], ZMIJ_U32_CHAIN_COPY);
+#  endif
+      return out + c;
+#  endif
+#elif ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
       return itoa_body10(out, uint32_t(value),
                          count_digits(uint32_t(value), *d), *d);
 #else
