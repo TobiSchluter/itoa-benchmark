@@ -507,6 +507,49 @@ constexpr frac100_table make_frac100() {
   return t;
 }
 
+// u64 digits from two multiply chains in GPRs (see itoa). Experiment.
+#ifndef ZMIJ_USE_U64_CHAIN
+#  define ZMIJ_USE_U64_CHAIN 0
+#endif
+// 0: the blocks are left-aligned by a per-count scale and stored as they
+// are; 1: right-aligned blocks, left-aligned by one pshufb at the end.
+#ifndef ZMIJ_U64_CHAIN_SHUFFLE
+#  define ZMIJ_U64_CHAIN_SHUFFLE 0
+#endif
+
+#if ZMIJ_USE_U64_CHAIN
+// Tables for the u64 multiply chains.
+struct u64_chain_tables {
+  // Digit triples, ASCII. Print order (hundreds in the low byte, a zero pad
+  // byte on top) where the groups are stored straight from the table, one
+  // overlapping the previous one's pad; reversed (ones in the low byte) where
+  // they are packed into words for the pshufb window.
+  uint32_t triples[1000] = {};
+  // Per digit count c: {10^(10-c) or 1, 10^(20-c)} -- the scales that
+  // left-align the low block (c <= 10) and the high block (c >= 10).
+  uint64_t scale[21][2] = {};
+  constexpr u64_chain_tables() {
+    for (int i = 0; i < 1000; ++i) {
+      uint32_t h = '0' + i / 100, t = '0' + i / 10 % 10, o = '0' + i % 10;
+      // Reversed with the pad in the LOW byte for the staged form, so a
+      // stored entry's pad falls on the less significant neighbour, which
+      // arrives later.
+      triples[i] = ZMIJ_U64_CHAIN_SHUFFLE == 2 ? o << 8 | t << 16 | h << 24
+                   : ZMIJ_U64_CHAIN_SHUFFLE     ? o | t << 8 | h << 16
+                                                : h | t << 8 | o << 16;
+    }
+    uint64_t p = 1;
+    for (int e = 0; e <= 19; ++e, p *= 10) {
+      if (e <= 9) scale[10 - e][0] = p;
+      scale[20 - e][1] = p;
+    }
+    for (int c = 11; c <= 20; ++c) scale[c][0] = 1;
+    scale[0][0] = scale[10][0];  // c == 0 never occurs; keep the row sane
+    scale[0][1] = scale[1][1];
+  }
+};
+#endif
+
 struct data {
   static constexpr auto splat64(uint64_t x) -> uint128 { return {x, x}; }
   static constexpr auto splat32(uint32_t x) -> uint128 {
@@ -698,6 +741,9 @@ struct data {
 #endif
   frac100_table frac100 = make_frac100();
   uint32_t frac_mul = frac_tail_mul;  // loaded, not materialized, on NEON
+#if ZMIJ_USE_U64_CHAIN
+  u64_chain_tables u64_chain;
+#endif
 };
 alignas(64) constexpr data static_data;
 
@@ -1400,7 +1446,124 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       return out + len;
 #endif
     } else {
-#if ZMIJ_USE_SSE4_1 && (ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_U64_SPLIT12)
+#if ZMIJ_USE_U64_CHAIN && ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128
+      // Two 10-digit blocks from one 64x64->128 multiply by ceil(2^97 / 1e10):
+      // the high word holds hi = v / 1e10 above bit 33 and the low block as
+      // a fraction below it; extended with the low word and rounded up, the
+      // fraction is exact to 0.29 * 2^-33, enough for ten digits. Each block
+      // then runs a jeaiii-style chain in 64 bits: (f & mask) * 10^k steps
+      // expose digit groups, looked up in the triple table.
+      constexpr uint64_t split_mul = 15845632502852867519ull;  // ceil(2^97/1e10)
+      constexpr uint64_t m54 = (uint64_t(1) << 54) - 1;
+      const uint32_t* tr = d->u64_chain.triples;
+      uint64_t c = count_digits(v, *d);
+#  if !ZMIJ_U64_CHAIN_SHUFFLE
+      // Left-align by scaling: for c <= 10 the value itself (v * 10^(10-c)
+      // < 1e10, exact), for c > 10 the high block (hi * 10^(20-c) < 1e10).
+      // Then both blocks print as ten digits from their first significant
+      // one, each group stored as it comes from the table: the high block
+      // at out, the low block at out + c - 10 (at out when c <= 10, over
+      // the high block's ten '0's). Each 4-byte store's pad lands under the
+      // next store; the high block's last pad is under the low block's
+      // first store, the low block ends on a single computed digit. The
+      // scaled high block spans [1e9, 1e10), beyond what a 64-bit
+      // multiplier can divide exactly, so it gets its own 128-bit product,
+      // exact to 2^-59.
+      constexpr uint64_t hi_mul = 9903520314283042200ull;  // ceil(2^93/1e9)
+      uint64_t s_lo = d->u64_chain.scale[c][0];
+      uint64_t s_hi = d->u64_chain.scale[c][1];
+      uint128_t p = uint128_t(v * s_lo) * split_mul;
+      uint64_t ph = uint64_t(p >> 64), pl = uint64_t(p);
+      uint64_t hi = (ph >> 33) * s_hi;
+      uint64_t fl = ((ph << 21 | pl >> 43) & m54) + 1;
+      uint128_t q = uint128_t(hi) * hi_mul;
+      uint64_t qh = uint64_t(q >> 64), ql = uint64_t(q);
+      uint64_t d1 = qh >> 29;
+      uint64_t fh = ((qh << 25 | ql >> 39) & m54) + 1;
+      // High block: D1 then three triples; low block: three triples and a
+      // digit. Each block is packed into an 8-byte word plus a 2-byte
+      // remainder in print order -- the entries' pad bytes fall under the
+      // next entry -- so four stores cover the twenty bytes.
+      char* lo_out = out + (c > 10 ? c - 10 : 0);
+      uint64_t t;
+      t = fh * 1000; uint64_t th1 = tr[t >> 54]; fh = t & m54;
+      t = fh * 1000; uint64_t th2 = tr[t >> 54]; fh = t & m54;
+      t = fh * 1000; uint64_t th3 = tr[t >> 54];
+      uint64_t w0 = ('0' + d1) | th1 << 8 | th2 << 32 | th3 << 56;
+      uint16_t w1 = uint16_t(th3 >> 8);
+      t = fl * 1000; uint64_t t1 = tr[t >> 54]; fl = t & m54;
+      t = fl * 1000; uint64_t t2 = tr[t >> 54]; fl = t & m54;
+      t = fl * 1000; uint64_t t3 = tr[t >> 54]; fl = t & m54;
+      t = fl * 10;
+      uint64_t w2 = t1 | t2 << 24 | t3 << 48;
+      uint16_t w3 = uint16_t((t3 >> 16) | ('0' + (t >> 54)) << 8);
+      copy_bytes(out, &w0, 8);
+      copy_bytes(out + 8, &w1, 2);
+      copy_bytes(lo_out, &w2, 8);
+      copy_bytes(lo_out + 8, &w3, 2);
+      return out + c;
+#  else
+      // Right-aligned blocks: hi < 1.85e9 keeps the high block's chain in 64
+      // bits (head 0 or 1, exact for any multiplier excess). The 16 low
+      // digits go through one revalign pshufb like the other u64 forms, the
+      // top four through a byte-swapped word left-aligned by its length.
+      constexpr uint64_t hi_mul = 2305843010ull;  // ceil(2^61/1e9)
+      constexpr uint64_t m61 = (uint64_t(1) << 61) - 1;
+      uint128_t p = uint128_t(v) * split_mul;
+      uint64_t ph = uint64_t(p >> 64), pl = uint64_t(p);
+      uint64_t hi = ph >> 33;
+      uint64_t fl = ((ph << 21 | pl >> 43) & m54) + 1;
+      uint64_t fh = hi * hi_mul;
+      uint64_t d1 = fh >> 61;
+      fh = ((fh & m61) >> 7) + 1;
+      uint64_t hlen = c > 16 ? c - 16 : 0;
+      uint64_t t;
+#    if ZMIJ_U64_CHAIN_SHUFFLE == 2
+      // The reversed 20-byte string (buf[1 + i] = D20-i) is written to a
+      // stack buffer straight from the table entries as each arrives, and
+      // read back in one piece: no shifts, no GPR-to-XMM inserts, at the
+      // price of a load that spans several stores and cannot be forwarded.
+      // An entry stored at buf + p puts its low digit at position p and its
+      // pad at position p - 1, under the next group's top digit; at the
+      // block boundary th3's pad is under t1's top digit, so t1 is stored
+      // after it. The low block is 3+3+3+1 so no pair entry sits inside.
+      alignas(16) char buf[32];
+      t = fh * 1000; uint64_t th1 = tr[t >> 54]; fh = t & m54;
+      t = fh * 1000; copy_bytes(buf + 13, &tr[t >> 54], 4); fh = t & m54;  // D5..D7
+      t = fh * 1000; copy_bytes(buf + 10, &tr[t >> 54], 4);                // D8..D10
+      t = fl * 1000; copy_bytes(buf + 7, &tr[t >> 54], 4); fl = t & m54;   // D11..D13
+      t = fl * 1000; copy_bytes(buf + 4, &tr[t >> 54], 4); fl = t & m54;   // D14..D16
+      t = fl * 1000; copy_bytes(buf + 1, &tr[t >> 54], 4); fl = t & m54;   // D17..D19
+      t = fl * 10;   buf[1] = char('0' + (t >> 54));                        // D20
+      // D1..D4 never pass through the window: the head is built from the
+      // registers, as in the packed form. th1 is reversed with the pad low.
+      uint64_t head = bswap64((('0' + d1) << 24 | th1 >> 8) << 32);
+      head >>= (32 - 8 * hlen) & 63;  // hlen == 0: unshifted, overwritten
+      copy_bytes(out, &head, 4);
+      __m128i x = _mm_loadu_si128(m128ptr(buf + 1));
+#    else
+      t = fh * 1000; uint64_t th1 = tr[t >> 54]; fh = t & m54;
+      t = fh * 1000; uint64_t th2 = tr[t >> 54]; fh = t & m54;
+      t = fh * 1000; uint64_t th3 = tr[t >> 54];
+      t = fl * 100;  uint64_t p0 = tr[t >> 54]; fl = t & m54;
+      t = fl * 1000; uint64_t t1 = tr[t >> 54]; fl = t & m54;
+      t = fl * 1000; uint64_t t2 = tr[t >> 54]; fl = t & m54;
+      t = fl * 100;  uint64_t pz = tr[t >> 54];
+      // Byte 0 = last digit: w0 = D13..D20, w1 = D5..D12, head = D1..D4.
+      uint64_t w0 = (t1 << 24 | t2) << 16 | pz;
+      uint64_t w1 = th2 << 40 | th3 << 16 | p0;
+      uint64_t head = bswap64((('0' + d1) << 24 | th1) << 32);
+      head >>= (32 - 8 * hlen) & 63;  // hlen == 0: unshifted, overwritten
+      copy_bytes(out, &head, 4);
+      __m128i x = _mm_set_epi64x(int64_t(w1), int64_t(w0));
+#    endif
+      __m128i shuffle = _mm_loadu_si128(
+          m128ptr(d->revalign_shuffle + (c < 16 ? 16 - c : 0)));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(out + hlen),
+                       _mm_shuffle_epi8(x, shuffle));
+      return out + c;
+#  endif
+#elif ZMIJ_USE_SSE4_1 && (ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_U64_SPLIT12)
       // Both SSE4.1 forms split v with the same pair of independent
       // reciprocal multiplies -- q16 = v / 1e16 and q8 = v / 1e8, where
       // (v / 1e8) / 1e8 == q16 -- so neither divide nests on the other or on

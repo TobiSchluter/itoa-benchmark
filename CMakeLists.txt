@@ -58,7 +58,7 @@ endif()
 file(GLOB ITOA_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 # The zmij variant TUs are compiled separately, each pinned to its own
 # microarchitecture level (below), so keep them out of the -march=native target.
-list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v2_ft|x64_v3|x64_v4|x64_native|x64_native_ft|neon|neon_ft|neon_shim))\\.cpp$")
+list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v2_ft|x64_v3|x64_v4|x64_native|x64_native_ft|x64_chain|x64_chain_sh|x64_chain_st|neon|neon_ft|neon_shim))\\.cpp$")
 
 add_executable(itoa ${ITOA_SOURCES})
 target_include_directories(itoa PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -132,6 +132,10 @@ else()
     endif()
     add_zmij_variant(zmij_x64_native "-march=native;-mtune=native")
     add_zmij_variant(zmij_x64_native_ft "-march=native;-mtune=native")
+    add_zmij_variant(zmij_x64_chain "-march=native;-mtune=native")
+    add_zmij_variant(zmij_x64_chain_sh "-march=native;-mtune=native")
+    add_zmij_variant(zmij_x64_chain_st "-march=native;-mtune=native")
+    target_compile_options(zmij_x64_chain_st PRIVATE -fno-stack-protector)
 
     # zmij's NEON path, lowered to SSE by Intel's neon2sse header so it can be
     # benchmarked beside the x64 tiers. Off by default: it needs the header
