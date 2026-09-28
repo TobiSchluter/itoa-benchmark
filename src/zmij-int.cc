@@ -94,6 +94,36 @@ static_assert(!ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_AVX2);
 #  define ZMIJ_USE_U64_SPLIT12 0
 #endif
 
+// The 4 + 16 top peel for the generic SSE4.1 tier, with a digits2 LUT head:
+// rest = v % 1e16 always fits the 16-digit kernel, so no value on the data
+// path is selected and the length pattern of the input cannot cost a branch;
+// its two reciprocal divides (v / 1e16, v / 1e8) issue off v in parallel, the
+// kernel lanes are packed into an XMM register before the head so nothing of
+// them is held in GPRs across it, and the head itself is one 4-byte load from
+// a 1845-entry table of left-aligned digit strings (7380 bytes). Measured on
+// Raptor Lake (i9-13900KF) against the 16 + 4 bottom peel below, uniform
+// across every mode:
+//   x86-64-v2  gcc-16 u64 -19%, i64 -16%;  clang-21 u64 -33%, i64 -30%
+//   native     gcc-16 u64 -20%, i64 -18%;  clang-21 u64 -35%, i64 -31%
+// The benchmark keeps the table in L1; a workload that sees 17..20-digit
+// values only occasionally pays a cache miss on the head load instead, off
+// the kernel's critical path. SSE4.1 only: the revalign shuffle is pshufb.
+// Off by default.
+#ifndef ZMIJ_USE_U64_TOP_PEEL
+#  define ZMIJ_USE_U64_TOP_PEEL 0
+#endif
+
+// The u64 bottom peel's 4-digit tail from one 64-bit product: the quotient
+// low4 / 100 is its high half, and the remainder's digit pair is looked up by
+// the top 7 bits of its fractional half. With low4 < 10000 and the /100
+// reciprocal 5243 / 2^19, the fraction for remainder r lies in
+// [r/100, r/100 + 0.0023), so 128 buckets of width 1/128 never mix two
+// remainders (checked exhaustively). Saves the q * 100 multiply and the
+// subtract; the two lookups no longer depend on each other.
+#ifndef ZMIJ_USE_FRAC_TAIL
+#  define ZMIJ_USE_FRAC_TAIL 0
+#endif
+
 #ifdef __x86_64__
 #  define ZMIJ_X86_64 1
 #else
@@ -443,6 +473,40 @@ struct inc_lt1e16_rows {
 };
 #endif  // ZMIJ_USE_NEON
 
+// The top peel's head as a table: for q16 in [0, 1845), its digits without
+// leading zeros, left-aligned in four bytes. What follows the digits is dead,
+// the kernel store covers it. 7380 bytes, so it sits after the tables the
+// other paths use.
+struct top4_table {
+  char e[1845][4];
+};
+constexpr top4_table make_top4() {
+  top4_table t{};
+  for (int v = 0; v < 1845; ++v) {
+    char buf[4] = {'0', '0', '0', '0'};
+    int n = v, len = 0;
+    do { buf[3 - len] = char('0' + n % 10); n /= 10; ++len; } while (n != 0);
+    for (int i = 0; i < 4; ++i) t.e[v][i] = i < len ? buf[4 - len + i] : '0';
+  }
+  return t;
+}
+
+// digits of n % 100 for n < 10000, indexed by bits 25..31 of the 32-bit
+// fractional part of n * (5243 << 13). 256 bytes.
+constexpr uint32_t frac_tail_mul = 5243u << 13;
+struct frac100_table {
+  char e[128][2];
+};
+constexpr frac100_table make_frac100() {
+  frac100_table t{};
+  for (uint32_t n = 0; n < 10000; ++n) {
+    uint32_t idx = uint32_t(uint64_t(n) * frac_tail_mul) >> 25;
+    t.e[idx][0] = char('0' + n % 100 / 10);
+    t.e[idx][1] = char('0' + n % 10);
+  }
+  return t;
+}
+
 struct data {
   static constexpr auto splat64(uint64_t x) -> uint128 { return {x, x}; }
   static constexpr auto splat32(uint32_t x) -> uint128 {
@@ -629,6 +693,11 @@ struct data {
 #endif  // ZMIJ_USE_NEON
 
   count_digits_tables cd_tables;
+#if ZMIJ_USE_U64_TOP_PEEL && ZMIJ_USE_SSE4_1
+  top4_table top4 = make_top4();
+#endif
+  frac100_table frac100 = make_frac100();
+  uint32_t frac_mul = frac_tail_mul;  // loaded, not materialized, on NEON
 };
 alignas(64) constexpr data static_data;
 
@@ -1013,17 +1082,32 @@ ZMIJ_NOINLINE static void itoa_body32_pad(char* out, uint64_t mid,
 // Builds the 16 ASCII digits from the two 8-digit lanes (hi = value / 1e8,
 // lo = value % 1e8) and applies shuffle. Taking the lanes rather than the
 // value lets u64toa compute them from independent divides of v (see there).
-ZMIJ_INLINE auto to_ascii16_lanes_and_shuffle(uint32_t hi, uint32_t lo,
-                                              const __m128i& shuffle,
-                                              const data& d) noexcept
-    -> __m128i {
+// The kernel from the packed lanes vector (hi in lane 1, lo in lane 0) on.
+ZMIJ_INLINE auto to_ascii16_x_and_shuffle(__m128i x, const __m128i& shuffle,
+                                          const data& d) noexcept -> __m128i {
   const __m128i div10k = _mm_load_si128(m128ptr(&d.div10k));
   const __m128i neg10k = _mm_load_si128(m128ptr(&d.neg10k));
-  __m128i x = _mm_set_epi64x(hi, lo);
   __m128i y = _mm_add_epi64(
       x, _mm_mul_epu32(neg10k,
                        _mm_srli_epi64(_mm_mul_epu32(x, div10k), div10k_exp)));
   return _mm_shuffle_epi8(to_ascii_4x4(y, d), shuffle);
+}
+
+ZMIJ_INLINE auto to_ascii16_lanes_and_shuffle(uint32_t hi, uint32_t lo,
+                                              const __m128i& shuffle,
+                                              const data& d) noexcept
+    -> __m128i {
+  return to_ascii16_x_and_shuffle(_mm_set_epi64x(hi, lo), shuffle, d);
+}
+
+// itoa_body_lanes on an already packed lanes vector, for a caller that moves
+// hi/lo out of GPRs as soon as it has them. Used by the top peel.
+[[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE void itoa_body_lanes_x(
+    char* out, __m128i x, uint64_t leading_zeroes, const data& d) noexcept {
+  __m128i shuffle = _mm_loadu_si128(
+      reinterpret_cast<const __m128i*>(d.revalign_shuffle + leading_zeroes));
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(out),
+                   to_ascii16_x_and_shuffle(x, shuffle, d));
 }
 
 ZMIJ_INLINE auto to_ascii16_and_shuffle(uint64_t value, const __m128i& shuffle,
@@ -1378,21 +1462,57 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       uint32_t low4 = uint32_t(v - high * 10000);
       uint64_t body = big ? high : v;  // body < 1e16 either way
       char* p = itoa_body(out, body, count_digits_lt_1e16(body, *d), *d);
+#    if ZMIJ_USE_FRAC_TAIL
+      uint64_t t = uint64_t(low4) * d->frac_mul;
+      copy_bytes(p, digits2(t >> 32), 2);
+      copy_bytes(p + 2, d->frac100.e[uint32_t(t) >> 25], 2);
+#    else
       uint32_t low4_hi = uint32_t((uint64_t(low4) * d->div100_full[0]) >> 37);
       copy_bytes(p, digits2(low4_hi), 2);
       copy_bytes(p + 2, digits2(low4 - low4_hi * d->div100_full[1]), 2);
+#    endif
       // The trailing digits only count if they aren't redundant.
       return p + 4 * big;
 #  else
+#    if ZMIJ_USE_U64_TOP_PEEL && ZMIJ_USE_SSE4_1
+      // v = q16 * 1e16 + rest, q16 <= 1844. rest goes through the 16-digit
+      // kernel whatever the length, so nothing here is selected on it; its
+      // lanes come from two reciprocal divides of v that do not nest:
+      // rest / 1e8 = q8 - q16 * 1e8 and rest % 1e8 = v - q8 * 1e8.
+      uint64_t c = count_digits(v, *d);
+      uint64_t q16 = v / uint64_t(1e16);
+      uint64_t q8 = v / 100'000'000ull;
+      uint32_t hi = uint32_t(q8 - q16 * 100'000'000ull);
+      uint32_t lo = uint32_t(v - q8 * 100'000'000ull);
+      // Into an XMM register now: the head below is all GPR work, and keeping
+      // hi/lo (or their products) live across it is what made both compilers
+      // save callee-saved registers.
+      __m128i lanes = _mm_set_epi64x(hi, lo);
+      // The head is q16's digits, at most four, left-aligned at out straight
+      // from the table: one load, one store. The kernel's 16-byte store at
+      // out + hlen overwrites whatever lands above hlen, including all of it
+      // when hlen == 0.
+      uint64_t hlen = c < 16 ? 0 : c - 16;
+      copy_bytes(out, d->top4.e[q16], 4);
+      itoa_body_lanes_x(out + hlen, lanes, c < 16 ? 16 - c : 0, *d);
+      return out + c;
+#    else
       uint64_t high = v / 10000;
       uint32_t low4 = uint32_t(v - high * 10000);
       uint64_t big = v >= uint64_t(1e16);
       uint64_t body = big ? high : v;  // body < 1e16 either way
       char* p = itoa_body(out, body, count_digits_lt_1e16(body, *d), *d);
+#      if ZMIJ_USE_FRAC_TAIL
+      uint64_t t = uint64_t(low4) * frac_tail_mul;
+      copy_bytes(p, digits2(t >> 32), 2);
+      copy_bytes(p + 2, d->frac100.e[uint32_t(t) >> 25], 2);
+#      else
       copy_bytes(p, digits2(low4 / 100), 2);
       copy_bytes(p + 2, digits2(low4 % 100), 2);
+#      endif
       // The trailing digits only count if they aren't redundant.
       return p + 4 * big;
+#    endif  // ZMIJ_USE_U64_TOP_PEEL
 #  endif  // ZMIJ_USE_NEON
 #else
       // u64: at most 20 digits -> three groups (top, mid 8, low 8). The top

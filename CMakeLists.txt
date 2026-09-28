@@ -58,7 +58,7 @@ endif()
 file(GLOB ITOA_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 # The zmij variant TUs are compiled separately, each pinned to its own
 # microarchitecture level (below), so keep them out of the -march=native target.
-list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v3|x64_v4|x64_native|neon|neon_shim))\\.cpp$")
+list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v2_ft|x64_v3|x64_v4|x64_native|x64_native_ft|neon|neon_ft|neon_shim))\\.cpp$")
 
 add_executable(itoa ${ITOA_SOURCES})
 target_include_directories(itoa PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -102,14 +102,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
     if(ITOA_NATIVE)
         add_zmij_variant(zmij_scalar  -march=native)
         add_zmij_variant(zmij_neon    -march=native)
+        add_zmij_variant(zmij_neon_ft -march=native)
     else()
         add_zmij_variant(zmij_scalar  "")
         add_zmij_variant(zmij_neon    "")
+        add_zmij_variant(zmij_neon_ft "")
     endif()
 else()
     add_zmij_variant(zmij_scalar          -march=x86-64)
     add_zmij_variant(zmij_x64_v1          -march=x86-64)
     add_zmij_variant(zmij_x64_v2          -march=x86-64-v2)
+    add_zmij_variant(zmij_x64_v2_ft       -march=x86-64-v2)
     add_zmij_variant(zmij_x64_v3          -march=x86-64-v3)
     # The v4 tier is linked only where the build host can execute AVX-512:
     # the tier's global constant tables get a dynamic initializer that the
@@ -128,6 +131,7 @@ else()
         message(STATUS "Host cannot execute AVX-512; skipping the zmij v4 tier")
     endif()
     add_zmij_variant(zmij_x64_native "-march=native;-mtune=native")
+    add_zmij_variant(zmij_x64_native_ft "-march=native;-mtune=native")
 
     # zmij's NEON path, lowered to SSE by Intel's neon2sse header so it can be
     # benchmarked beside the x64 tiers. Off by default: it needs the header
