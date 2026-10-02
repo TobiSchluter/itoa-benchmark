@@ -69,31 +69,6 @@ static_assert(!ZMIJ_USE_AVX2 || ZMIJ_USE_SSE4_1);
 #  define ZMIJ_USE_AVX2 0
 #endif
 
-// The float-reciprocal 4-digit peel for the u64 head. A win on Zen 5, where
-// the FP digit kernel rides ports the integer chain leaves idle; a loss on
-// the Intel cores measured, whose vector and scalar ports are shared.
-#ifdef ZMIJ_USE_AVX2_U64_FP
-// Use the provided definition.
-static_assert(!ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_AVX2);
-#elif ZMIJ_USE_AVX2 && (defined(__znver5__) || defined(__tune_znver5__))
-#  define ZMIJ_USE_AVX2_U64_FP 1
-#else
-#  define ZMIJ_USE_AVX2_U64_FP 0
-#endif
-
-// The 12 + 8 u64 split, whose 8-digit tail rides to_ascii_4x4 in XMM. Like
-// the FP peel this pays off where vector and scalar ports are split (Zen 5)
-// and loses where they are shared: +22-31% on the u64 streams measured on
-// Tiger Lake, so generic SSE4.1 keeps the 16 + 4 peel below. The fork uses
-// it unconditionally on SSE4.1 (tuned on Zen 5).
-#ifdef ZMIJ_USE_U64_SPLIT12
-// Use the provided definition.
-#elif ZMIJ_USE_SSE4_1 && (defined(__znver5__) || defined(__tune_znver5__))
-#  define ZMIJ_USE_U64_SPLIT12 1
-#else
-#  define ZMIJ_USE_U64_SPLIT12 0
-#endif
-
 // The 4 + 16 top peel for the generic SSE4.1 tier, with a digits2 LUT head:
 // rest = v % 1e16 always fits the 16-digit kernel, so no value on the data
 // path is selected and the length pattern of the input cannot cost a branch;
@@ -339,17 +314,6 @@ constexpr uint32_t neg10 = (1 << 8) - 10;
 
 constexpr uint64_t zeros = 0x0101010101010101u * '0';
 
-// Splits x < 1e8 into (x / 10000) << 32 | (x % 10000). x < 1e8 is a caller
-// precondition the type cannot express: values reach ~1e8 (27 bits) so the
-// input is uint32_t, but uint32_t's range (~4.29e9) runs well past the
-// reciprocal's ~4.94e8 exactness limit, so an out-of-contract input would
-// silently divide wrong. The result packs into 64 bits, and the divide
-// multiply is widened back to 64 bits, where it must stay.
-[[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE auto split10k(uint32_t x) noexcept
-    -> uint64_t {
-  return x + neg10k * ((uint64_t(x) * div10k_sig) >> div10k_exp);
-}
-
 // count_digits tables. The index is the RAW output of the leading-zero
 // instruction so no fixup is ever emitted: with LZCNT (or ARM's clz) that is
 // clz(n | 1) itself, while on x64 without it clz lowers to bsr ^ 63, so
@@ -508,12 +472,25 @@ constexpr frac100_table make_frac100() {
   return t;
 }
 
-#if ZMIJ_USE_AVX2_U64_FP
+// The u64 kernel (see itoa): the 20-digit grid as five 4-digit groups from
+// two 128-bit products, two group chains running side by side in the two
+// 64-bit lanes of an XMM register. It needs SSE4.1 and a 64x64->128
+// multiply; other configurations, NEON included, keep the 16 + 4 peel. The top group comes
+// from a 7380-byte string table, or under ZMIJ_OPTIMIZE_SIZE from one product
+// and two small tables.
+// The GPR chain and top peel experiments replace it when they are on.
+#ifndef ZMIJ_USE_U64_LANE_CHAIN
+#  define ZMIJ_USE_U64_LANE_CHAIN                     \
+    (ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128 && !ZMIJ_USE_U64_CHAIN && \
+     !ZMIJ_USE_U64_TOP_PEEL)
+#endif
+
+#if ZMIJ_USE_U64_LANE_CHAIN && ZMIJ_OPTIMIZE_SIZE
 struct head4_tables {
   // Per count c, 10^(20-c) -- the scale that left-aligns the head to four
   // digits: head * scale < 10000 for every count, and the head is zero below
   // 17 -- times frac_tail_mul, so one multiply both aligns the head and
-  // splits it (see write_frac_head4). The aligned head's quotient runs
+  // splits it (see write_head4). The aligned head's quotient runs
   // 10..99, so the pair table covers all of it.
   uint64_t mul4[21] = {};
   uint16_t pairs[100] = {};
@@ -527,7 +504,7 @@ struct head4_tables {
     }
   }
 };
-#endif  // ZMIJ_USE_AVX2_U64_FP
+#endif
 
 // u64 digits from two multiply chains in GPRs (see itoa). Experiment.
 #ifndef ZMIJ_USE_U64_CHAIN
@@ -572,41 +549,21 @@ struct u64_chain_tables {
 };
 #endif
 
-// u64 digits from two 4-digit-group chains running side by side in the two
-// 64-bit lanes of one XMM register: pmuludq by 10^4 keeps each lane's
-// fraction in place and leaves the group in the high dword, one shuffle
-// gathers the four groups for to_ascii_4x4, and one window shuffle chosen by
-// the digit count lays the 16 low digits out; the top four come from a GPR.
-// Experiment.
-#ifndef ZMIJ_USE_U64_LANE_CHAIN
-#  define ZMIJ_USE_U64_LANE_CHAIN 0
-#endif
-
 #if ZMIJ_USE_U64_LANE_CHAIN
 struct u64_lane_tables {
   uint128 k1e4 = {10000, 10000};  // 10^4 in each qword lane's low dword
   // ceil(2^90 / 1e8), a memory operand for both splits: x * it has x / 1e8
   // above bit 90 and (x mod 1e8) / 1e8 below, exact to x * 0.0076 / 2^90.
   uint64_t mul90 = 12379400392853802749ull;
-  // ASCII digit pairs, print order (tens in the low byte), for the head.
-  uint16_t pairs[100] = {};
   // Window shuffles by digit count. to_ascii_4x4 leaves the vector as
   // [G2 G4 G3 G5] with each group's digits reversed within its dword; entry
   // c lays digits 5..20 out in print order dropping the first 16 - c bytes
   // (none for c >= 16), zeros after.
-  uint8_t window[21][16] = {};
-  // By digit count: the head word's right shift, 8 * (4 - head digits),
-  // and the body's offset, the head digits max(c - 16, 0).
-  uint8_t head_shift[21] = {};
+  alignas(16) uint8_t window[21][16] = {};
+  // By digit count: the body's offset, the head digits max(c - 16, 0).
   uint8_t body_off[21] = {};
   constexpr u64_lane_tables() {
-    for (int i = 0; i < 100; ++i)
-      pairs[i] = uint16_t(('0' + i / 10) | ('0' + i % 10) << 8);
-    for (int c = 0; c <= 20; ++c) {
-      int hs = c > 16 ? c - 16 : 0;
-      head_shift[c] = uint8_t(32 - 8 * hs);
-      body_off[c] = uint8_t(hs);
-    }
+    for (int c = 0; c <= 20; ++c) body_off[c] = uint8_t(c > 16 ? c - 16 : 0);
     constexpr uint8_t print_order[16] = {3, 2, 1, 0,  11, 10, 9,  8,
                                          7, 6, 5, 4,  15, 14, 13, 12};
     for (int c = 0; c <= 20; ++c) {
@@ -814,16 +771,13 @@ struct data {
   // SSE4.1 pshufb uses it (SSE2 itoa left-aligns by the scale10 pre-scale;
   // the padded bodies use bswap), so it's absent from non-SSE4.1 builds.
 #if ZMIJ_USE_SSE4_1
-  // The 0x80 run extends to offset 24 so every all-padding window is a valid
-  // 16-byte load. Offsets past 16 arise where a store's digits are entirely
-  // overwritten by a later store: u64toa lets its kernel length go negative
-  // (down to -7) rather than clamping it, which puts the offset 16 - len as
-  // high as 23.
-  alignas(32) unsigned char revalign_shuffle[40] = {
+  // Read 16 bytes at offset 16 - len, len in [1, 16], so the reversal drops
+  // the 16 - len leading zeros and the 0x80 run zeroes the bytes past them.
+  alignas(32) unsigned char revalign_shuffle[32] = {
       15,   14,   13,   12,   11,   10,   9,    8,    7,    6,
       5,    4,    3,    2,    1,    0,    0x80, 0x80, 0x80, 0x80,
       0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+      0x80, 0x80};
   // Like revalign_shuffle, but for itoa_body10's lane layout (lane0 = mid
   // 4 digits, lane1 = top 4, lane2 = bottom 2): indexing at 10 - len drops
   // the leading zeros and emits the ten digits MSB-first in one pshufb.
@@ -891,12 +845,13 @@ struct data {
 #endif  // ZMIJ_USE_NEON
 
   count_digits_tables cd_tables;
-#if ZMIJ_USE_U64_TOP_PEEL && ZMIJ_USE_SSE4_1
+#if (ZMIJ_USE_U64_TOP_PEEL && ZMIJ_USE_SSE4_1) || \
+    (ZMIJ_USE_U64_LANE_CHAIN && !ZMIJ_OPTIMIZE_SIZE)
   top4_table top4 = make_top4();
 #endif
   frac100_table frac100 = make_frac100();
   uint32_t frac_mul = frac_tail_mul;  // loaded, not materialized, on NEON
-#if ZMIJ_USE_AVX2_U64_FP
+#if ZMIJ_USE_U64_LANE_CHAIN && ZMIJ_OPTIMIZE_SIZE
   head4_tables head4;
 #endif
 #if ZMIJ_USE_U64_CHAIN
@@ -910,6 +865,31 @@ struct data {
 #endif
 };
 alignas(64) constexpr data static_data;
+
+#if ZMIJ_USE_U64_LANE_CHAIN
+// Writes the u64 value's top four digits at out, left-aligned: the caller's
+// body store covers whatever of the four is surplus, all four when the head
+// is empty. `head` is the digits above the low 16, at most 1844, and `c` the
+// value's total digit count.
+#  if ZMIJ_OPTIMIZE_SIZE
+// One product: head * mul4[c] has the aligned head's /100 quotient above bit
+// 32 -- indexing the pair table -- and the remainder's pair under the
+// fraction's top 7 bits (frac100). Storing the two pairs separately beat
+// merging them into a word by 0.05..0.17 ns on x86.
+ZMIJ_INLINE void write_head4(char* out, uint64_t head, uint64_t c,
+                             const data& d) noexcept {
+  uint64_t t = head * d.head4.mul4[c];
+  copy_bytes(out, &d.head4.pairs[t >> 32], 2);
+  copy_bytes(out + 2, d.frac100.e[uint32_t(t) >> 25], 2);
+}
+#  else
+// One load from the 7380-byte table of left-aligned strings, one store.
+ZMIJ_INLINE void write_head4(char* out, uint64_t head, uint64_t,
+                             const data& d) noexcept {
+  copy_bytes(out, d.top4.e[head], 4);
+}
+#  endif
+#endif
 
 #if ZMIJ_USE_NEON
 // count_digits_lt_1e16 loads the fused count entry from byte offset
@@ -994,22 +974,6 @@ ZMIJ_INLINE auto to_ascii_4x4(__m128i y, const data& d) noexcept -> __m128i {
 }
 #  endif  // ZMIJ_USE_SSE4_1
 
-#  if ZMIJ_USE_AVX2_U64_FP
-// Writes the value's top four digits at out, left-aligned, from one product:
-// `head` is v / 1e16 <= 1844, `c` the value's digit count, and head *
-// mul4[c] has the aligned head's /100 quotient above bit 32 -- indexing the
-// pair table -- and the remainder's pair under the fraction's top 7 bits
-// (frac100). The caller's body store covers whatever of the four bytes is
-// surplus, all four when the head is empty. Storing the two pairs separately
-// beat merging them into a word by 0.05..0.17 ns on x86.
-ZMIJ_INLINE void write_frac_head4(char* out, uint64_t head, uint64_t c,
-                                  const data& d) noexcept {
-  uint64_t t = head * d.head4.mul4[c];
-  copy_bytes(out, &d.head4.pairs[t >> 32], 2);
-  copy_bytes(out + 2, d.frac100.e[uint32_t(t) >> 25], 2);
-}
-#  endif  // ZMIJ_USE_AVX2_U64_FP
-
 #endif  // ZMIJ_USE_SSE
 
 struct bcd_result {
@@ -1024,8 +988,8 @@ struct bcd_result {
 ZMIJ_INLINE auto to_bcd8_split(uint32_t abcdefgh, uint32_t abcd) noexcept
     -> bcd_result {
   if (!ZMIJ_USE_SSE && !ZMIJ_USE_NEON) {
-    // Three steps BCD. Base 10000 -> base 100 -> base 10 (see split10k for
-    // the simultaneous div/mod trick, continued here at the lower bases).
+    // Three steps BCD. Base 10000 -> base 100 -> base 10, each step adding
+    // neg * quotient so quotient and remainder land side by side.
     uint64_t abcd_efgh = abcdefgh + neg10k * uint64_t(abcd);
     uint64_t ab_cd_ef_gh =
         abcd_efgh +
@@ -1295,7 +1259,7 @@ ZMIJ_INLINE auto to_ascii16_lanes_and_shuffle(uint32_t hi, uint32_t lo,
   return to_ascii16_x_and_shuffle(_mm_set_epi64x(hi, lo), shuffle, d);
 }
 
-// itoa_body_lanes on an already packed lanes vector, for a caller that moves
+// itoa_body on two already packed lanes, for a caller that moves
 // hi/lo out of GPRs as soon as it has them. Used by the top peel.
 [[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE void itoa_body_lanes_x(
     char* out, __m128i x, uint64_t leading_zeroes, const data& d) noexcept {
@@ -1312,8 +1276,8 @@ ZMIJ_INLINE auto to_ascii16_and_shuffle(uint64_t value, const __m128i& shuffle,
                                       d);
 }
 
-// Unused under AVX2, where the u64 path uses itoa_body_lanes and the u128
-// paths use itoa_body_head16_pad / itoa_top8.
+// Unused where the u64 path is the lane chain and the u128 paths use
+// itoa_body_head16_pad / itoa_top8.
 [[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE char* itoa_body(char* out, uint64_t value,
                                                   uint64_t len,
                                                   const data& d) noexcept {
@@ -1324,21 +1288,6 @@ ZMIJ_INLINE auto to_ascii16_and_shuffle(uint64_t value, const __m128i& shuffle,
   __m128i ascii = to_ascii16_and_shuffle(value, shuffle, d);
   _mm_storeu_si128(reinterpret_cast<__m128i*>(out), ascii);
   return out + len;
-}
-
-// itoa_body with the value / 1e8 divmod lanes supplied by the caller, and the
-// revalign_shuffle offset (16 - digit count) rather than the count itself, so
-// the caller can pass an offset past 16 -- an all-padding window emitting 16
-// zero bytes -- where a later store overwrites the field entirely. The caller
-// advances its own output pointer. Used by the gated u64 splits only.
-[[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE void itoa_body_lanes(char* out, uint32_t hi, uint32_t lo,
-                                 uint64_t leading_zeroes,
-                                 const data& d) noexcept {
-  __m128i shuffle = _mm_loadu_si128(
-      reinterpret_cast<const __m128i*>(d.revalign_shuffle + leading_zeroes));
-
-  __m128i ascii = to_ascii16_lanes_and_shuffle(hi, lo, shuffle, d);
-  _mm_storeu_si128(reinterpret_cast<__m128i*>(out), ascii);
 }
 
 ZMIJ_INLINE char* itoa_body10(char* out, uint32_t value, uint64_t len,
@@ -1678,7 +1627,7 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       return out + len;
 #endif
     } else {
-#if ZMIJ_USE_U64_LANE_CHAIN && ZMIJ_USE_SSE4_1 && ZMIJ_USE_INT128
+#if ZMIJ_USE_U64_LANE_CHAIN && ZMIJ_USE_SSE4_1
       // Five 4-digit groups G1..G5 on the 20-digit grid. Two products by
       // ceil(2^90 / 1e8): v's gives q = v / 1e8 above bit 90 and G4 G5 as
       // the fraction below; q's gives G1 above bit 90 and G2 G3 below. The
@@ -1703,21 +1652,12 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       __m128i g = _mm_castps_si128(_mm_shuffle_ps(
           _mm_castsi128_ps(s1), _mm_castsi128_ps(s2), _MM_SHUFFLE(3, 1, 3, 1)));
       __m128i ascii = to_ascii_4x4(g, *d);  // [G2 G4 G3 G5], reversed within
-      // G1's two pairs form the head word, left-aligned by a shift and
-      // stored first; the window shuffle puts digits 5..20 in print order,
-      // left-aligned for c <= 16, stored over the head's unused bytes at
-      // out + (c - 16 or 0). The shift and the offset come from byte tables
-      // by count: computing them cost gcc a sign-mask ladder and two spills.
-      // One product gives both pairs: the quotient g1 / 100 in the high
-      // word, the remainder's digits from the top 7 bits of the fraction
-      // (see frac100); the lookups no longer wait on each other.
-      uint64_t t1 = g1 * frac_tail_mul;
-      uint16_t g1_lo;
-      copy_bytes(&g1_lo, d->frac100.e[uint32_t(t1) >> 25], 2);
-      uint64_t head = d->u64_lane.pairs[t1 >> 32] | uint64_t(g1_lo) << 16;
-      head >>= d->u64_lane.head_shift[c];
+      // The head is G1's four digits, left-aligned at out; the window
+      // shuffle puts digits 5..20 in print order, left-aligned for c <= 16,
+      // stored over the head's unused bytes at out + (c - 16 or 0), the
+      // offset from a byte table by count.
       __m128i window = _mm_loadu_si128(m128ptr(d->u64_lane.window[c]));
-      copy_bytes(out, &head, 4);
+      write_head4(out, g1, c, *d);
       _mm_storeu_si128(
           reinterpret_cast<__m128i*>(out + d->u64_lane.body_off[c]),
           _mm_shuffle_epi8(ascii, window));
@@ -1839,53 +1779,6 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
                        _mm_shuffle_epi8(x, shuffle));
       return out + c;
 #  endif
-#elif ZMIJ_USE_SSE4_1 && (ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_U64_SPLIT12)
-      // Both SSE4.1 forms split v with the same pair of independent
-      // reciprocal multiplies -- q16 = v / 1e16 and q8 = v / 1e8, where
-      // (v / 1e8) / 1e8 == q16 -- so neither divide nests on the other or on
-      // a cmov. They differ in where the split falls, and the tiers disagree
-      // about which is better: with AVX2 the 4-digit group rides the FP digit
-      // kernel on the FP ports, so peeling 4 + 16 wins; without it that group
-      // would go through the GPR divmod/LUT, and 12 + 8 -- whose 8-digit
-      // group reuses the integer to_ascii_4x4 -- wins instead.
-      uint32_t q16 = uint32_t(v / uint64_t(1e16));
-      uint64_t q8 = v / 100'000'000ull;
-      uint64_t c = count_digits(v, *d);
-#  if ZMIJ_USE_AVX2_U64_FP
-      // 4 + 16 split: the <= 4-digit head is out of the FP digit kernel,
-      // whose sliding pack window drops its leading zeros, and stores
-      // straight from the register; rest = v % 1e16 goes through the
-      // 16-digit kernel, whose 16-byte store overwrites the head's garbage
-      // bytes above hlen.
-      uint64_t hlen = c < 16 ? 0 : c - 16;
-      write_frac_head4(out, q16, c, *d);  // the head from one integer product
-      uint32_t hi = uint32_t(q8 - q16 * 100'000'000ull);
-      uint32_t lo = uint32_t(v - q8 * 100'000'000ull);
-      itoa_body_lanes(out + hlen, hi, lo, c < 16 ? 16 - c : 0, *d);
-#  else
-      // 12 + 8 split: hi12 = v / 1e8 through the 16-digit kernel, lo8 =
-      // v % 1e8 as an 8-digit tail through to_ascii_4x4, trimmed and
-      // reversed by one revalign_shuffle window.
-      //
-      // The kernel's digit count, c - 8, is not clamped: for v < 1e8 it goes
-      // negative and the offset 16 - (c - 8) = 24 - c runs past the shuffle
-      // table's real entries into the 0x80 run, so the kernel stores 16 zero
-      // bytes that the tail store then overwrites. That keeps the mask offset
-      // dependent on c alone instead of waiting for a clamp. Only the tail's
-      // store address still needs one, since a negative offset would write
-      // before out; it is off the critical path, and the tail's own offset
-      // 16 - min(c, 8) derives from it without a second compare.
-      uint64_t klen = c > 8 ? c - 8 : 0;
-      uint32_t hi = uint32_t(q8 - q16 * 100'000'000ull);
-      uint32_t lo8 = uint32_t(v - q8 * 100'000'000ull);
-      itoa_body_lanes(out, q16, hi, 24 - c, *d);
-      __m128i ascii = to_ascii_4x4(_mm_set_epi64x(0, split10k(lo8)), *d);
-      __m128i shuf =
-          _mm_loadu_si128(m128ptr(d->revalign_shuffle + (16 - c + klen)));
-      _mm_storel_epi64(reinterpret_cast<__m128i*>(out + klen),
-                       _mm_shuffle_epi8(ascii, shuf));
-#  endif
-      return out + c;
 #elif ZMIJ_USE_SSE || ZMIJ_USE_NEON
       // We peel off the last four digits and always write them at the end,
       // but if the number is < 10000 we don't move them around but instead

@@ -58,7 +58,7 @@ endif()
 file(GLOB ITOA_SOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/src/*.cpp")
 # The zmij variant TUs are compiled separately, each pinned to its own
 # microarchitecture level (below), so keep them out of the -march=native target.
-list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v3|x64_v4|x64_native|x64_chain|x64_lchain|x64_chain_sh|x64_chain_st|x64_chain32|x64_chain32t|x64_chain32s|x64_chain32w|x64_chain32v|neon|neon_chain32|neon_chain32t|neon_chain32s|neon_chain32w|neon_chain32v|neon_shim))\\.cpp$")
+list(FILTER ITOA_SOURCES EXCLUDE REGEX "/(zmij_(scalar|x64_v1|x64_v2|x64_v3|x64_v4|x64_native|x64_chain|x64_chain_sh|x64_chain_st|x64_chain32|x64_chain32t|x64_chain32s|x64_chain32w|x64_chain32v|neon|neon_chain32|neon_chain32t|neon_chain32s|neon_chain32w|neon_chain32v|neon_shim))\\.cpp$")
 
 add_executable(itoa ${ITOA_SOURCES})
 target_include_directories(itoa PRIVATE "${CMAKE_SOURCE_DIR}/src")
@@ -139,7 +139,6 @@ else()
     endif()
     add_zmij_variant(zmij_x64_native "-march=native;-mtune=native")
     add_zmij_variant(zmij_x64_chain "-march=native;-mtune=native")
-    add_zmij_variant(zmij_x64_lchain "-march=native;-mtune=native")
     add_zmij_variant(zmij_x64_chain_sh "-march=native;-mtune=native")
     add_zmij_variant(zmij_x64_chain_st "-march=native;-mtune=native")
     target_compile_options(zmij_x64_chain_st PRIVATE -fno-stack-protector)
