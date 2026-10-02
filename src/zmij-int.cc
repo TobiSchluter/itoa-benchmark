@@ -113,17 +113,6 @@ static_assert(!ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_AVX2);
 #  define ZMIJ_USE_U64_TOP_PEEL 0
 #endif
 
-// The u64 bottom peel's 4-digit tail from one 64-bit product: the quotient
-// low4 / 100 is its high half, and the remainder's digit pair is looked up by
-// the top 7 bits of its fractional half. With low4 < 10000 and the /100
-// reciprocal 5243 / 2^19, the fraction for remainder r lies in
-// [r/100, r/100 + 0.0023), so 128 buckets of width 1/128 never mix two
-// remainders (checked exhaustively). Saves the q * 100 multiply and the
-// subtract; the two lookups no longer depend on each other.
-#ifndef ZMIJ_USE_FRAC_TAIL
-#  define ZMIJ_USE_FRAC_TAIL 0
-#endif
-
 #ifdef __x86_64__
 #  define ZMIJ_X86_64 1
 #else
@@ -491,9 +480,21 @@ constexpr top4_table make_top4() {
   return t;
 }
 
+// The u64 kernels' 4-digit group -- the 16 + 4 peel's tail, the 4 + 16
+// split's head and the scalar kernel's top group -- as two pairs from one
+// product instead of a divide, a multiply and a subtract: n * (5243 << 13),
+// the /100 reciprocal 5243 / 2^19 scaled to a 32-bit fraction, has n / 100
+// above bit 32 and the remainder's pair under the fraction's top 7 bits. With
+// n < 10000 the fraction for remainder r lies in [r/100, r/100 + 0.0023), so
+// 128 buckets of width 1/128 never mix two remainders (checked exhaustively);
+// the two lookups no longer depend on each other. For the head, mul4[c] =
+// 10^(20-c) * (5243 << 13) folds the left-alignment to four digits into the
+// same multiply: the aligned head's quotient, 10..99, indexes a pair table,
+// and the four bytes store at out with the body's 16-byte store at out + hlen
+// covering whatever is surplus.
+constexpr uint32_t frac_tail_mul = 5243u << 13;
 // digits of n % 100 for n < 10000, indexed by bits 25..31 of the 32-bit
 // fractional part of n * (5243 << 13). 256 bytes.
-constexpr uint32_t frac_tail_mul = 5243u << 13;
 struct frac100_table {
   char e[128][2];
 };
@@ -506,6 +507,27 @@ constexpr frac100_table make_frac100() {
   }
   return t;
 }
+
+#if ZMIJ_USE_AVX2_U64_FP
+struct head4_tables {
+  // Per count c, 10^(20-c) -- the scale that left-aligns the head to four
+  // digits: head * scale < 10000 for every count, and the head is zero below
+  // 17 -- times frac_tail_mul, so one multiply both aligns the head and
+  // splits it (see write_frac_head4). The aligned head's quotient runs
+  // 10..99, so the pair table covers all of it.
+  uint64_t mul4[21] = {};
+  uint16_t pairs[100] = {};
+  constexpr head4_tables() {
+    for (int i = 0; i < 100; ++i)
+      pairs[i] = uint16_t(('0' + i / 10) | ('0' + i % 10) << 8);
+    for (int c = 0; c <= 20; ++c) {
+      uint64_t p = 1;
+      for (int k = c; k < 20 && c > 16; ++k) p *= 10;
+      mul4[c] = p * frac_tail_mul;
+    }
+  }
+};
+#endif  // ZMIJ_USE_AVX2_U64_FP
 
 // u64 digits from two multiply chains in GPRs (see itoa). Experiment.
 #ifndef ZMIJ_USE_U64_CHAIN
@@ -736,9 +758,7 @@ struct data {
   uint64_t u64toa_consts[2] = {0x346dc5d63886594b, 9999999999999999};
   int32x4 multipliers32 = {div10k_sig, neg10k, div100_sig << 12, neg100};
   int16x8 multipliers16 = {0xce0, neg10};
-  // Full-range u32 /100 reciprocal (ceil(2^37 / 100), shift 37) paired with
-  // the divisor so the u64 path's digits2 tail gets both from one ldp.
-  uint32_t div100_full[2] = {0x51EB851F, 100};
+  uint64_t pad = 0;  // keeps the head at 80 bytes
   uint64_t hundred_million = 100000000;
   // Rows 10..64 of the fused count table, at byte offset 80 == 10 * 8.
   inc_lt1e16_rows inc_rows;
@@ -836,21 +856,6 @@ struct data {
       0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
   // Float constants for the reciprocal digit kernels, kept in the table so they
   // load as disp(base) off the shared data pointer like the integer constants.
-#    if ZMIJ_USE_AVX2_U64_FP
-  alignas(16) float peel4_recip[4] = {1e-3f, 1e-2f, 1e-1f, 1e0f};  // to_ascii4_ps
-  alignas(16) float peel4_bias[4] = {8388608.0f + '0', 8388608.0f + '0',
-                                     8388608.0f + '0', 8388608.0f + '0'};
-  alignas(16) float ten_ps[4] = {10.0f, 10.0f, 10.0f, 10.0f};
-  // Sliding gather for the to_ascii4_dig_ps digits (ASCII in the low byte of
-  // each 32-bit lane, MSD first): loading 16 bytes at offset lz both packs
-  // the four digits and drops lz leading ones in the same pshufb. lz <= 4,
-  // so the 16-byte read at offset 4 stays inside the 32 bytes.
-  alignas(32) unsigned char peel4_pack[32] = {
-      0,    4,    8,    12,   0x80, 0x80, 0x80, 0x80,
-      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
-      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
-#    endif  // ZMIJ_USE_AVX2_U64_FP
   alignas(16) float top8_recip[4] = {1e0f, 1e-2f, 1e-4f, 1e-6f};  // itoa_top8
   alignas(16) float hundred_ps[4] = {100.0f, 100.0f, 100.0f, 100.0f};
 #  endif  // ZMIJ_USE_AVX2
@@ -891,6 +896,9 @@ struct data {
 #endif
   frac100_table frac100 = make_frac100();
   uint32_t frac_mul = frac_tail_mul;  // loaded, not materialized, on NEON
+#if ZMIJ_USE_AVX2_U64_FP
+  head4_tables head4;
+#endif
 #if ZMIJ_USE_U64_CHAIN
   u64_chain_tables u64_chain;
 #endif
@@ -987,33 +995,18 @@ ZMIJ_INLINE auto to_ascii_4x4(__m128i y, const data& d) noexcept -> __m128i {
 #  endif  // ZMIJ_USE_SSE4_1
 
 #  if ZMIJ_USE_AVX2_U64_FP
-// Converts one number < 10000 to its four ASCII digits via a float reciprocal
-// multiply. The four lanes hold floor(n/1000), floor(n/100), floor(n/10), n;
-// a per-lane truncation floors exactly (n < 2^24, so n and every quotient are
-// representable in f32 and the reciprocal rounding never crosses an integer
-// boundary), and fnmadd(10, shift1(qf), qf) isolates each decimal digit as
-// digit_k = qf_k - 10 * qf_{k-1}. Returns the len significant digits as
-// ASCII in the low bytes (most-significant first, zero fill above), ready
-// for a 4-byte store: the sliding peel4_pack window both packs the digit
-// lanes and drops the 4 - len leading zeros in one pshufb.
-ZMIJ_INLINE auto to_ascii4_ps(uint32_t n, uint64_t len,
-                              const data& d) noexcept -> __m128i {
-  const __m128 recip = _mm_load_ps(d.peel4_recip);
-  const __m128 ten = _mm_load_ps(d.ten_ps);
-  // peel4_bias = 2^23 + '0': adding it to the exact-integer digit forces the
-  // float->int round-magic (the integer lands in the low mantissa bits) while
-  // also biasing by '0', so the low byte of each lane is directly the ASCII code
-  // -- no cvttps and no separate '0' add. The add runs parallel with the shift.
-  const __m128 bias = _mm_load_ps(d.peel4_bias);
-  __m128 xf = _mm_cvtepi32_ps(_mm_set1_epi32(int(n)));
-  __m128 qf = _mm_round_ps(_mm_mul_ps(xf, recip),
-                           _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC);
-  __m128 shifted = _mm_castsi128_ps(_mm_slli_si128(_mm_castps_si128(qf), 4));
-  // digit_k + '0' + 2^23 = (qf_k + bias) - 10 * qf_{k-1}
-  __m128i dig =
-      _mm_castps_si128(_mm_fnmadd_ps(ten, shifted, _mm_add_ps(qf, bias)));
-  __m128i pack = _mm_loadu_si128(m128ptr(d.peel4_pack + (4 - len)));
-  return _mm_shuffle_epi8(dig, pack);
+// Writes the value's top four digits at out, left-aligned, from one product:
+// `head` is v / 1e16 <= 1844, `c` the value's digit count, and head *
+// mul4[c] has the aligned head's /100 quotient above bit 32 -- indexing the
+// pair table -- and the remainder's pair under the fraction's top 7 bits
+// (frac100). The caller's body store covers whatever of the four bytes is
+// surplus, all four when the head is empty. Storing the two pairs separately
+// beat merging them into a word by 0.05..0.17 ns on x86.
+ZMIJ_INLINE void write_frac_head4(char* out, uint64_t head, uint64_t c,
+                                  const data& d) noexcept {
+  uint64_t t = head * d.head4.mul4[c];
+  copy_bytes(out, &d.head4.pairs[t >> 32], 2);
+  copy_bytes(out + 2, d.frac100.e[uint32_t(t) >> 25], 2);
 }
 #  endif  // ZMIJ_USE_AVX2_U64_FP
 
@@ -1865,7 +1858,7 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       // 16-digit kernel, whose 16-byte store overwrites the head's garbage
       // bytes above hlen.
       uint64_t hlen = c < 16 ? 0 : c - 16;
-      _mm_storeu_si32(out, to_ascii4_ps(q16, hlen, *d));
+      write_frac_head4(out, q16, c, *d);  // the head from one integer product
       uint32_t hi = uint32_t(q8 - q16 * 100'000'000ull);
       uint32_t lo = uint32_t(v - q8 * 100'000'000ull);
       itoa_body_lanes(out + hlen, hi, lo, c < 16 ? 16 - c : 0, *d);
@@ -1908,15 +1901,9 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       uint32_t low4 = uint32_t(v - high * 10000);
       uint64_t body = big ? high : v;  // body < 1e16 either way
       char* p = itoa_body(out, body, count_digits_lt_1e16(body, *d), *d);
-#    if ZMIJ_USE_FRAC_TAIL
       uint64_t t = uint64_t(low4) * d->frac_mul;
       copy_bytes(p, digits2(t >> 32), 2);
       copy_bytes(p + 2, d->frac100.e[uint32_t(t) >> 25], 2);
-#    else
-      uint32_t low4_hi = uint32_t((uint64_t(low4) * d->div100_full[0]) >> 37);
-      copy_bytes(p, digits2(low4_hi), 2);
-      copy_bytes(p + 2, digits2(low4 - low4_hi * d->div100_full[1]), 2);
-#    endif
       // The trailing digits only count if they aren't redundant.
       return p + 4 * big;
 #  else
@@ -1948,14 +1935,9 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       uint64_t big = v >= uint64_t(1e16);
       uint64_t body = big ? high : v;  // body < 1e16 either way
       char* p = itoa_body(out, body, count_digits_lt_1e16(body, *d), *d);
-#      if ZMIJ_USE_FRAC_TAIL
       uint64_t t = uint64_t(low4) * frac_tail_mul;
       copy_bytes(p, digits2(t >> 32), 2);
       copy_bytes(p + 2, d->frac100.e[uint32_t(t) >> 25], 2);
-#      else
-      copy_bytes(p, digits2(low4 / 100), 2);
-      copy_bytes(p + 2, digits2(low4 % 100), 2);
-#      endif
       // The trailing digits only count if they aren't redundant.
       return p + 4 * big;
 #    endif  // ZMIJ_USE_U64_TOP_PEEL
@@ -1970,9 +1952,11 @@ ZMIJ_INLINE auto itoa(char* out, UInt value) noexcept -> char* {
       uint32_t top = uint32_t(v / uint64_t(1e16));  // <= 1844
       uint64_t lo = to_bcd8(uint32_t(v - q * 100'000'000ull)).bcd + zeros;
       uint64_t mid = to_bcd8(uint32_t(q - top * 100'000'000ull)).bcd + zeros;
-      uint32_t top_hi = (top * div100_sig) >> div100_exp;
-      copy_bytes(buf + 4, digits2(top_hi), 2);
-      copy_bytes(buf + 6, digits2(top - top_hi * 100), 2);
+      // One product: top / 100 (at most 18) above bit 32, the remainder's
+      // pair under the fraction's top 7 bits.
+      uint64_t t = uint64_t(top) * frac_tail_mul;
+      copy_bytes(buf + 4, digits2(t >> 32), 2);
+      copy_bytes(buf + 6, d->frac100.e[uint32_t(t) >> 25], 2);
       copy_bytes(buf + 8, &mid, 8);
       copy_bytes(buf + 16, &lo, 8);
       uint64_t len = count_digits(v, *d);
